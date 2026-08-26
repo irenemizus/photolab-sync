@@ -1,0 +1,9 @@
+[submodule "third-party/exiv2"]
+	path = third-party/exiv2
+	url = https://github.com/Exiv2/exiv2.git
+[submodule "third-party/libexpat"]
+	path = third-party/libexpat
+	url = https://github.com/libexpat/libexpat.git
+[submodule "third-party/zlib"]
+	path = third-party/zlib
+	url = https://github.com/madler/zlib.git
