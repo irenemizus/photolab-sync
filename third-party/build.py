@@ -4,6 +4,10 @@
 Everything is installed into third-party/prefix, using @rpath-based install
 names and relative rpaths so the whole tree is relocatable.
 
+Usage:
+  build.py         configure, build and install everything into prefix
+  build.py clean   remove the build directories and the prefix tree
+
 Environment overrides:
   CMAKE   path to the cmake executable (default: cmake from PATH,
           falls back to ../.venv-3.13/bin/cmake)
@@ -34,10 +38,16 @@ def find_cmake() -> str:
     sys.exit(1)
 
 
-CMAKE = find_cmake()
+CMAKE: str
+JOBS: int
 
-JOBS = int(os.environ.get("JOBS") or subprocess.check_output(
-    ["sysctl", "-n", "hw.ncpu"]).strip().splitlines()[0])
+
+def clean() -> None:
+    for d in (PREFIX, TP / "zlib" / "build", TP / "libexpat" / "build", TP / "exiv2" / "build"):
+        if d.exists():
+            shutil.rmtree(d)
+            print(f"removed {d.relative_to(TP)}")
+    print("done.")
 
 
 def build(src: Path, builddir: Path, args: list[str]) -> None:
@@ -106,57 +116,73 @@ def normalize_rpaths(file: Path, want: str) -> None:
             ["install_name_tool", "-add_rpath", want, str(file)], check=True)
 
 
-# Fresh install tree on every run (build dirs are kept for incremental builds).
-if PREFIX.exists():
-    shutil.rmtree(PREFIX)
-PREFIX.mkdir(parents=True)
+def main() -> None:
+    global CMAKE, JOBS
+    CMAKE = find_cmake()
+    JOBS = int(os.environ.get("JOBS") or subprocess.check_output(
+        ["sysctl", "-n", "hw.ncpu"]).strip().splitlines()[0])
 
-# --- zlib (shared) ---
-build(TP / "zlib", TP / "zlib" / "build", [
-    "-DCMAKE_BUILD_TYPE=Release",
-    f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
-    '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
-    "-DCMAKE_INSTALL_RPATH=",
-    "-DZLIB_BUILD_SHARED=ON",
-    "-DZLIB_BUILD_STATIC=OFF",
-    "-DZLIB_BUILD_TESTING=OFF",
-])
-install(TP / "zlib" / "build")
+    # Fresh install tree on every run (build dirs are kept for incremental builds).
+    if PREFIX.exists():
+        shutil.rmtree(PREFIX)
+    PREFIX.mkdir(parents=True)
 
-# --- libexpat (shared) ---
-build(TP / "libexpat" / "expat", TP / "libexpat" / "build", [
-    "-DCMAKE_BUILD_TYPE=Release",
-    f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
-    '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
-    "-DCMAKE_INSTALL_RPATH=",
-    "-DBUILD_SHARED_LIBS=ON",
-    "-DEXPAT_BUILD_TESTS=OFF",
-    "-DEXPAT_BUILD_TOOLS=OFF",
-    "-DEXPAT_BUILD_EXAMPLES=OFF",
-])
-install(TP / "libexpat" / "build")
+    # --- zlib (shared) ---
+    build(TP / "zlib", TP / "zlib" / "build", [
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
+        '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
+        "-DCMAKE_INSTALL_RPATH=",
+        "-DZLIB_BUILD_SHARED=ON",
+        "-DZLIB_BUILD_STATIC=OFF",
+        "-DZLIB_BUILD_TESTING=OFF",
+    ])
+    install(TP / "zlib" / "build")
 
-# --- exiv2 (finds zlib/expat in prefix) ---
-build(TP / "exiv2", TP / "exiv2" / "build", [
-    "-DCMAKE_BUILD_TYPE=Release",
-    f"-DCMAKE_PREFIX_PATH={PREFIX}",
-    f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
-    '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
-    "-DCMAKE_INSTALL_RPATH=",
-    "-DEXIV2_ENABLE_INIH=OFF",
-    "-DEXIV2_ENABLE_BROTLI=OFF",
-])
-install(TP / "exiv2" / "build")
+    # --- libexpat (shared) ---
+    build(TP / "libexpat" / "expat", TP / "libexpat" / "build", [
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
+        '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
+        "-DCMAKE_INSTALL_RPATH=",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DEXPAT_BUILD_TESTS=OFF",
+        "-DEXPAT_BUILD_TOOLS=OFF",
+        "-DEXPAT_BUILD_EXAMPLES=OFF",
+    ])
+    install(TP / "libexpat" / "build")
 
-# CMake bakes an absolute rpath into the CLI (for the build-tree libexiv2);
-# replace it with a relative one so the tree stays relocatable.
-normalize_rpaths(PREFIX / "bin" / "exiv2", "@loader_path/../lib")
-# libexiv2 finds libz/libexpat in its own directory.
-normalize_rpaths(PREFIX / "lib" / "libexiv2.dylib", "@loader_path")
+    # --- exiv2 (finds zlib/expat in prefix) ---
+    build(TP / "exiv2", TP / "exiv2" / "build", [
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_PREFIX_PATH={PREFIX}",
+        f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
+        '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
+        "-DCMAKE_INSTALL_RPATH=",
+        "-DEXIV2_ENABLE_INIH=OFF",
+        "-DEXIV2_ENABLE_BROTLI=OFF",
+    ])
+    install(TP / "exiv2" / "build")
 
-# --- sanity check ---
-print("=== sanity check ===")
-version = subprocess.run(
-    [str(PREFIX / "bin" / "exiv2"), "--version"], capture_output=True, text=True, check=True)
-print(version.stdout.splitlines()[0])
-print("done.")
+    # CMake bakes an absolute rpath into the CLI (for the build-tree libexiv2);
+    # replace it with a relative one so the tree stays relocatable.
+    normalize_rpaths(PREFIX / "bin" / "exiv2", "@loader_path/../lib")
+    # libexiv2 finds libz/libexpat in its own directory.
+    normalize_rpaths(PREFIX / "lib" / "libexiv2.dylib", "@loader_path")
+
+    # --- sanity check ---
+    print("=== sanity check ===")
+    version = subprocess.run(
+        [str(PREFIX / "bin" / "exiv2"), "--version"], capture_output=True, text=True, check=True)
+    print(version.stdout.splitlines()[0])
+    print("done.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "clean":
+        clean()
+    elif len(sys.argv) == 1:
+        main()
+    else:
+        print("usage: build.py [clean]", file=sys.stderr)
+        sys.exit(2)
