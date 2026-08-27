@@ -4,16 +4,25 @@
 Everything is installed into third-party/prefix, using @rpath-based install
 names and relative rpaths so the whole tree is relocatable.
 
+Then compiles pyexiv2's C++ binding against that prefix and pip-installs
+pyexiv2 into the venv running this script.
+
 Usage:
-  build.py         configure, build and install everything into prefix
-  build.py clean   remove the build directories and the prefix tree
+  build.py         configure, build and install everything into prefix,
+                   then build and install pyexiv2 into the current venv
+  build.py clean   remove the build directories, the prefix tree and the
+                   staged pyexiv2 build artifacts
 
 Environment overrides:
   CMAKE   path to the cmake executable (default: cmake from PATH,
           e.g. the one in your activated venv)
   JOBS    parallel build jobs (default: number of CPUs)
+
+Note: pybind11 (headers only, needed to compile the pyexiv2 binding) is
+installed into the running venv if it is not already present.
 """
 
+import importlib.util
 import os
 import re
 import shutil
@@ -39,11 +48,25 @@ CMAKE: str
 JOBS: int
 
 
+PYEXIV2_SRC = TP / "pyexiv2"
+PYEXIV2_LIB = PYEXIV2_SRC / "pyexiv2" / "lib"
+# Our libexiv2's runtime dependencies, copied next to it so its @loader_path
+# rpath resolves them.
+PYEXIV2_RUNTIME_LIBS = ("libexiv2.dylib", "libexpat.1.dylib", "libz.1.dylib")
+# Artifacts staged into the pyexiv2 source tree (it is a submodule).
+PYEXIV2_ARTIFACTS = ("exiv2api.so",) + PYEXIV2_RUNTIME_LIBS
+
+
 def clean() -> None:
     for d in (PREFIX, TP / "zlib" / "build", TP / "libexpat" / "build", TP / "exiv2" / "build"):
         if d.exists():
             shutil.rmtree(d)
             print(f"removed {d.relative_to(TP)}")
+    for f in PYEXIV2_ARTIFACTS:
+        p = PYEXIV2_LIB / f
+        if p.exists():
+            p.unlink()
+            print(f"removed {p.relative_to(TP)}")
     print("done.")
 
 
@@ -113,6 +136,45 @@ def normalize_rpaths(file: Path, want: str) -> None:
             ["install_name_tool", "-add_rpath", want, str(file)], check=True)
 
 
+def build_pyexiv2() -> None:
+    # Installs pyexiv2 into the venv running this script, following pyexiv2's
+    # own build procedure (see pyexiv2/lib/README.md and
+    # .github/workflows/build.yml): compile the C++ binding next to a prebuilt
+    # exiv2 runtime library, drop both into pyexiv2/lib/, and let setup.py
+    # package that prebuilt artifact verbatim (it skips compilation when
+    # exiv2api.so is already present). Unlike the upstream exiv2 release,
+    # which links the system libexpat/libz, our libexiv2 references them via
+    # @rpath + its @loader_path rpath, so they must sit next to it as well.
+    # At import time pyexiv2/lib/__init__.py dlopens libexiv2.dylib from its
+    # own directory before importing exiv2api, whose (rpath-less) libexiv2
+    # dependency then resolves to that already-loaded image.
+    if importlib.util.find_spec("pybind11") is None:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pybind11"], check=True)
+    pybind11_includes = subprocess.check_output(
+        [sys.executable, "-m", "pybind11", "--includes"], text=True).split()
+
+    print("=== building: pyexiv2 binding ===")
+    subprocess.run(
+        ["c++", "exiv2api.cpp", "-o", "exiv2api.so", "-O3", "-Wall", "-std=c++11",
+         "-shared", "-fPIC"] + pybind11_includes +
+        ["-I", str(PREFIX / "include"), "-L", str(PREFIX / "lib"),
+         "-lexiv2", "-undefined", "dynamic_lookup"],
+        cwd=PYEXIV2_LIB, check=True)
+
+    print("=== staging: exiv2 runtime libraries ===")
+    for name in PYEXIV2_RUNTIME_LIBS:
+        shutil.copy2((PREFIX / "lib" / name).resolve(), PYEXIV2_LIB / name)
+
+    print("=== installing: pyexiv2 ===")
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", str(PYEXIV2_SRC)], check=True)
+
+    print("=== sanity check: pyexiv2 ===")
+    out = subprocess.run(
+        [sys.executable, "-c", "import pyexiv2; print(pyexiv2.__exiv2_version__)"],
+        capture_output=True, text=True, check=True).stdout
+    print(out.strip())
+
+
 def main() -> None:
     global CMAKE, JOBS
     CMAKE = find_cmake()
@@ -172,6 +234,9 @@ def main() -> None:
     version = subprocess.run(
         [str(PREFIX / "bin" / "exiv2"), "--version"], capture_output=True, text=True, check=True)
     print(version.stdout.splitlines()[0])
+
+    # --- pyexiv2 (into the venv running this script) ---
+    build_pyexiv2()
     print("done.")
 
 
