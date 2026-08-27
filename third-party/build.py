@@ -10,7 +10,7 @@ Usage:
 
 Environment overrides:
   CMAKE   path to the cmake executable (default: cmake from PATH,
-          falls back to ../.venv-3.13/bin/cmake)
+          e.g. the one in your activated venv)
   JOBS    parallel build jobs (default: number of CPUs)
 """
 
@@ -31,10 +31,7 @@ def find_cmake() -> str:
         return c
     if shutil.which("cmake"):
         return "cmake"
-    venv_cmake = TP.parent / ".venv-3.13" / "bin" / "cmake"
-    if venv_cmake.exists() and os.access(venv_cmake, os.X_OK):
-        return str(venv_cmake)
-    print("error: cmake not found (set CMAKE=/path/to/cmake)", file=sys.stderr)
+    print("error: cmake not found (activate your venv or set CMAKE=/path/to/cmake)", file=sys.stderr)
     sys.exit(1)
 
 
