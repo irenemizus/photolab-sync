@@ -5,24 +5,23 @@ Everything is installed into third-party/prefix, using @rpath-based install
 names and relative rpaths so the whole tree is relocatable.
 
 Then compiles pyexiv2's C++ binding against that prefix and pip-installs
-pyexiv2 into the venv running this script.
+pyexiv2 into the venv build.py was run from.
+
+All build-time dependencies (cmake, pybind11) are kept in a dedicated
+build venv at third-party/build/.venv, so the target venv only ever
+receives the final pyexiv2 package.
 
 Usage:
   build.py         configure, build and install everything into prefix,
                    then build and install pyexiv2 into the current venv
-  build.py clean   remove the build directories, the prefix tree and the
-                   staged pyexiv2 build artifacts
+  build.py clean   remove the build directories, the prefix tree, the
+                   build venv and the staged pyexiv2 build artifacts
 
 Environment overrides:
-  CMAKE   path to the cmake executable (default: cmake from PATH,
-          e.g. the one in your activated venv)
+  CMAKE   path to the cmake executable (default: cmake from the build venv)
   JOBS    parallel build jobs (default: number of CPUs)
-
-Note: pybind11 (headers only, needed to compile the pyexiv2 binding) is
-installed into the running venv if it is not already present.
 """
 
-import importlib.util
 import os
 import re
 import shutil
@@ -32,20 +31,53 @@ from pathlib import Path
 
 TP = Path(__file__).resolve().parent
 PREFIX = TP / "prefix"
+BUILD_VENV = TP / "build" / ".venv"
+
+
+def original_python() -> str:
+    # The venv build.py was launched from; the final pyexiv2 goes there.
+    if sys.prefix == sys.base_prefix:
+        print("error: run build.py from the target venv "
+              "(e.g. source <venv>/bin/activate && python build.py)", file=sys.stderr)
+        sys.exit(1)
+    return sys.executable
+
+
+def build_venv_python() -> str:
+    return str(BUILD_VENV / "bin" / "python")
+
+
+def ensure_build_venv() -> None:
+    py = build_venv_python()
+    if not Path(py).exists():
+        print(f"=== creating: {BUILD_VENV.relative_to(TP)} ===")
+        subprocess.run([sys.executable, "-m", "venv", str(BUILD_VENV)], check=True)
+    missing = []
+    if not (BUILD_VENV / "bin" / "cmake").exists():
+        missing.append("cmake")
+    probe = subprocess.run(
+        [py, "-c", "import pybind11"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode != 0:
+        missing.append("pybind11")
+    if missing:
+        print(f"=== installing into build venv: {' '.join(missing)} ===")
+        subprocess.run([py, "-m", "pip", "install", "--quiet", *missing], check=True)
 
 
 def find_cmake() -> str:
     c = os.environ.get("CMAKE")
     if c:
         return c
-    if shutil.which("cmake"):
-        return "cmake"
-    print("error: cmake not found (activate your venv or set CMAKE=/path/to/cmake)", file=sys.stderr)
+    venv_cmake = BUILD_VENV / "bin" / "cmake"
+    if venv_cmake.exists() and os.access(venv_cmake, os.X_OK):
+        return str(venv_cmake)
+    print("error: cmake not found (set CMAKE=/path/to/cmake)", file=sys.stderr)
     sys.exit(1)
 
 
 CMAKE: str
 JOBS: int
+TARGET_PY: str
 
 
 PYEXIV2_SRC = TP / "pyexiv2"
@@ -58,7 +90,7 @@ PYEXIV2_ARTIFACTS = ("exiv2api.so",) + PYEXIV2_RUNTIME_LIBS
 
 
 def clean() -> None:
-    for d in (PREFIX, TP / "zlib" / "build", TP / "libexpat" / "build", TP / "exiv2" / "build"):
+    for d in (PREFIX, BUILD_VENV, TP / "zlib" / "build", TP / "libexpat" / "build", TP / "exiv2" / "build"):
         if d.exists():
             shutil.rmtree(d)
             print(f"removed {d.relative_to(TP)}")
@@ -147,11 +179,11 @@ def build_pyexiv2() -> None:
     # @rpath + its @loader_path rpath, so they must sit next to it as well.
     # At import time pyexiv2/lib/__init__.py dlopens libexiv2.dylib from its
     # own directory before importing exiv2api, whose (rpath-less) libexiv2
-    # dependency then resolves to that already-loaded image.
-    if importlib.util.find_spec("pybind11") is None:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pybind11"], check=True)
+    # dependency then resolves to that already-loaded image. pybind11's
+    # headers come from the build venv (same interpreter version as the
+    # target one, since the build venv is created from it).
     pybind11_includes = subprocess.check_output(
-        [sys.executable, "-m", "pybind11", "--includes"], text=True).split()
+        [build_venv_python(), "-m", "pybind11", "--includes"], text=True).split()
 
     print("=== building: pyexiv2 binding ===")
     subprocess.run(
@@ -166,17 +198,19 @@ def build_pyexiv2() -> None:
         shutil.copy2((PREFIX / "lib" / name).resolve(), PYEXIV2_LIB / name)
 
     print("=== installing: pyexiv2 ===")
-    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", str(PYEXIV2_SRC)], check=True)
+    subprocess.run([TARGET_PY, "-m", "pip", "install", "--quiet", str(PYEXIV2_SRC)], check=True)
 
     print("=== sanity check: pyexiv2 ===")
     out = subprocess.run(
-        [sys.executable, "-c", "import pyexiv2; print(pyexiv2.__exiv2_version__)"],
+        [TARGET_PY, "-c", "import pyexiv2; print(pyexiv2.__exiv2_version__)"],
         capture_output=True, text=True, check=True).stdout
     print(out.strip())
 
 
 def main() -> None:
-    global CMAKE, JOBS
+    global CMAKE, JOBS, TARGET_PY
+    TARGET_PY = original_python()
+    ensure_build_venv()
     CMAKE = find_cmake()
     JOBS = int(os.environ.get("JOBS") or subprocess.check_output(
         ["sysctl", "-n", "hw.ncpu"]).strip().splitlines()[0])
