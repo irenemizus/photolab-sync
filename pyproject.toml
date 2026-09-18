@@ -6,6 +6,9 @@ requires-python = ">=3.10"
 dependencies = [
 ]
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "build_backend"
