@@ -13,6 +13,7 @@ Tags written (mimicking the PhotoLab reference file):
 
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import pyexiv2
@@ -32,52 +33,103 @@ MONTHS = {
 
 EM_DASH = " \u2014 "
 
+EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 
-def parse_path_parts(rel_path: Path):
-    parts = rel_path.parts[:-1]
-    if len(parts) != 7:
-        raise ValueError(f"expected 7 directory levels, got {len(parts)}: {rel_path}")
-    year_s, month_s, event, subevent, category, supplemental, rating_s = parts
-    year = int(year_s)
-    month = MONTHS[month_s.lower()]
-    rating = int(rating_s.split()[0])
-    return year, month, event, subevent, category, supplemental, rating
-
-
-def expected_tags(year, month, event, subevent, category, supplemental, rating):
-    return {
-        "Exif.Photo.DateTimeOriginal": f"{year:04d}:{month:02d}:01 00:00:00",
-        "Xmp.iptcExt.Event": f"{event}{EM_DASH}{subevent}",
-        "Xmp.xmp.Rating": str(rating),
-        "Xmp.photoshop.Category": category,
-        "Xmp.photoshop.SupplementalCategories": [supplemental],
-        "Iptc.Application2.Category": category,
-        "Iptc.Application2.SuppCategory": [supplemental],
-    }
+FIELDS = (
+    "date_time_original",
+    "event",
+    "subevent",
+    "category",
+    "supplemental_category",
+    "rating",
+)
 
 
-def write_metadata(image_path: Path, year, month, event, subevent, category, supplemental, rating):
-    with pyexiv2.Image(str(image_path)) as img:
-        img.modify_exif({"Exif.Photo.DateTimeOriginal": f"{year:04d}:{month:02d}:01 00:00:00"})
-        img.modify_xmp({
-            "Xmp.Iptc4xmpExt.Event": f"{event}{EM_DASH}{subevent}",
-            "Xmp.xmp.Rating": str(rating),
-            "Xmp.photoshop.Category": category,
-            "Xmp.photoshop.SupplementalCategories": [supplemental],
-        })
-        img.modify_iptc({
-            "Iptc.Application2.Category": category,
-            "Iptc.Application2.SuppCategory": [supplemental],
-        })
+class Metadata:
+    def __init__(self,
+                 date_time_original: datetime | None = None,
+                 event: str | None = None,
+                 subevent: str | None = None,
+                 category: str | None = None,
+                 supplemental_category: str | None = None,
+                 rating: int | None = None):
+        self.date_time_original = date_time_original
+        self.event = event
+        self.subevent = subevent
+        self.category = category
+        self.supplemental_category = supplemental_category
+        self.rating = rating
+
+    @classmethod
+    def from_file(cls, file_path: Path | str) -> "Metadata":
+        with pyexiv2.Image(str(file_path)) as img:
+            exif = img.read_exif()
+            xmp = img.read_xmp()
+            iptc = img.read_iptc()
+
+        date_time_original = None
+        value = exif.get("Exif.Photo.DateTimeOriginal")
+        if value:
+            date_time_original = datetime.strptime(value, EXIF_DATE_FORMAT)
+
+        event = None
+        subevent = None
+        value = xmp.get("Xmp.iptcExt.Event")
+        if value:
+            event, sep, sub = value.partition(EM_DASH)
+            if sep:
+                subevent = sub
+
+        category = xmp.get("Xmp.photoshop.Category") or iptc.get("Iptc.Application2.Category")
+
+        value = xmp.get("Xmp.photoshop.SupplementalCategories") or iptc.get("Iptc.Application2.SuppCategory")
+        supplemental_category = value[0] if value else None
+
+        rating = None
+        value = xmp.get("Xmp.xmp.Rating")
+        if value is not None:
+            rating = int(value)
+
+        return cls(date_time_original, event, subevent, category, supplemental_category, rating)
+
+    @classmethod
+    def from_path_string(cls, file_path: Path | str) -> "Metadata":
+        parts = Path(file_path).parts[:-1]
+        if len(parts) != 7:
+            raise ValueError(f"expected 7 directory levels, got {len(parts)}: {file_path}")
+        year_s, month_s, event, subevent, category, supplemental_category, rating_s = parts
+        return cls(
+            date_time_original=datetime(int(year_s), MONTHS[month_s.lower()], 1),
+            event=event,
+            subevent=subevent,
+            category=category,
+            supplemental_category=supplemental_category,
+            rating=int(rating_s.split()[0]),
+        )
+
+    def write_to_file(self, file_path: Path | str, write_date_time: bool = False):
+        with pyexiv2.Image(str(file_path)) as img:
+            if write_date_time:
+                img.modify_exif({
+                    "Exif.Photo.DateTimeOriginal": self.date_time_original.strftime(EXIF_DATE_FORMAT),
+                })
+            img.modify_xmp({
+                "Xmp.Iptc4xmpExt.Event": f"{self.event}{EM_DASH}{self.subevent}",
+                "Xmp.xmp.Rating": str(self.rating),
+                "Xmp.photoshop.Category": self.category,
+                "Xmp.photoshop.SupplementalCategories": [self.supplemental_category],
+            })
+            img.modify_iptc({
+                "Iptc.Application2.Category": self.category,
+                "Iptc.Application2.SuppCategory": [self.supplemental_category],
+            })
 
 
-def read_metadata(image_path: Path):
-    with pyexiv2.Image(str(image_path)) as img:
-        return {
-            **img.read_exif(),
-            **img.read_xmp(),
-            **img.read_iptc(),
-        }
+def compare_field(field: str, want, got):
+    if field == "date_time_original":
+        want = (want.year, want.month) if want is not None else None
+        got = (got.year, got.month) if got is not None else None
+    return want == got
 
 
 def find_images(root: Path):
@@ -97,18 +149,24 @@ def main():
     try:
         for image in find_images(dest_dir):
             rel_path = image.relative_to(dest_dir)
-            year, month, event, subevent, category, supplemental, rating = parse_path_parts(rel_path)
-            write_metadata(image, year, month, event, subevent, category, supplemental, rating)
+            expected = Metadata.from_path_string(rel_path)
 
-            expected = expected_tags(year, month, event, subevent, category, supplemental, rating)
-            actual = read_metadata(image)
-            print(f"\n{rel_path}")
-            for tag, want in expected.items():
-                got = actual.get(tag)
-                status = "OK" if got == want else "MISMATCH"
-                if got != want:
+            current = Metadata.from_file(image)
+            print(f"\n{rel_path}\nbefore:")
+            for field in FIELDS:
+                print(f"  {field}: {getattr(current, field)!r}")
+
+            expected.write_to_file(image)
+
+            actual = Metadata.from_file(image)
+            print("after:")
+            for field in FIELDS:
+                want = getattr(expected, field)
+                got = getattr(actual, field)
+                status = "OK" if compare_field(field, want, got) else "MISMATCH"
+                if not compare_field(field, want, got):
                     ok = False
-                print(f"  [{status}] {tag}: expected {want!r}, got {got!r}")
+                print(f"  [{status}] {field}: expected {want!r}, got {got!r}")
     finally:
         if ok:
             shutil.rmtree(tmp_dir)
