@@ -1,0 +1,14 @@
+[project]
+name = "photolab-sync"
+version = "0.1.0"
+description = "Sync photo metadata from the file-path layout into image tags."
+requires-python = ">=3.10"
+dependencies = [
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "build_backend"
+
+[tool.setuptools]
+py-modules = ["metadata", "place"]
