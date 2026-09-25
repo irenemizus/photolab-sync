@@ -1,11 +1,26 @@
 """Metadata model for reading and writing image tags via pyexiv2.
 
+Part of the SyncClient upload-preparation pipeline (see docs/design-metadata.md).
+For every local image the client does:
+    place = Place.from_path_string(rel_path)   # parse the 7-level layout
+    md    = Metadata.from_file(path)           # read whatever the file already has
+    md.patch_from_place(place)                 # fill missing fields from the path
+    md.write_to_file(...)                       # produce the FINAL file (kept in memory)
+The final file's pixels are uploaded to the SyncServer and SHA512-hashed (pixels only);
+its metadata is what Immich indexes and displays. The 7-level layout never reaches the
+server -- it is flattened into these tags before upload.
+
 Tags (mimicking the PhotoLab reference file):
     date_time_original -> Exif.Photo.DateTimeOriginal
     event/subevent     -> Xmp.iptcExt.Event, joined with an em-dash
     category           -> Iptc.Application2.Category + Xmp.photoshop.Category
     supplemental       -> Iptc.Application2.SuppCategory + Xmp.photoshop.SupplementalCategories
     rating             -> Xmp.xmp.Rating (XMP spec Part 1: -1 or [0..5])
+
+Date-time rule: the path carries only year/month, so date_time_original must be preserved
+from the original file (fall back to year/month/01 00:00:00 only when the file has none).
+TODO: pin down and test write_to_file's date-time behaviour (it currently only writes the
+date-time when write_date_time=True and would fail if date_time_original is None).
 """
 
 from datetime import datetime

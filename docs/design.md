@@ -1,61 +1,90 @@
-# Description
-The project is aimed to create an automatic 
-synchronization system between a local directory tree containing photos in 
-jpeg-like format and an Immich database located on the server side.
+# Photolab Sync — High-Level Design
 
-# Architecture
-## Main blocks
-The project should consist of 3 main blocks: 
-- Immich instance backend used as a blackbox via Immich API (located on a server node),
-- SyncServer -- a server part of the project (located on the same node as 
-the Immich backend),
-- SyncClient -- a client part of the project (located on the client machine 
-containing the directory tree with the photos locally).
+## Description
+Photolab Sync is an automated synchronization system between a local directory tree of
+photos (jpeg/tiff/png) and an Immich database.
 
-## Interaction between the blocks
-- Immich backend and SyncServer should communicate via Immich API;
-- SyncServer and SyncClient should communicate via a custom REST API (described below).
+- A **client machine** holds the local directory tree (the "source of truth").
+- A **server node** hosts an Immich backend and the SyncServer.
 
-## Blocks responsibilities
-### SyncClient should:
-- Calculate hash codes (SHA512 hash sums for file contents, collision probability is negligible) 
-for all the photos from the local directory tree,
-- Ask SyncServer to start the synchronization process,
-- Ask SyncServer to collect hash codes from the Immich database,
-- Poll SyncServer while it is computing the hash codes of the photos 
-from the Immich database, 
-- Ask SyncServer to command Immich to run several synchronization operations 
-(the full list will follow below),
-- Ask SyncServer to stop the synchronization process.
+The guiding principle: **the SyncClient is the brain** (it decides *what* to do) and
+**the SyncServer is a mostly dumb translator** (it only *applies* operations against
+Immich through the Immich API). Immich itself is treated as an opaque black box; we never
+rely on its internal implementation details.
 
-### SyncServer should:
-- Generate a one-time API key to identify the current synchronization session 
-by the SyncClient start synchronization request, and return it to SyncClient,
-- Block all the synchronization requests from all the other SyncClients (if any),
-- Request from Immich via the Immich API all the photos from its database one by one, and 
-calculate hash codes for all of them,
-- Pass on a command obtained from SyncClient to Immich (translate it from the SyncClient's 
-REST API to the related Immich API command),
-- Close the synchronization session by disabling the current session's one-time API key 
-(right after that it should be able to start a new one from another SyncClient if any).
+## Architecture
 
-### SyncServer REST API endpoints
-- `/v1/start-sync` -- Start synchronization request to SyncServer; 
-SyncServer should generate the one-time API key and return it to SyncClient, from this 
-moment and till it gets a request to stop the current synchronization session, SyncServer should 
-refuse any other start synchronization requests;
-- `/v1/collect` -- Collect hash codes request to SyncServer;
-SyncServer should request from Immich via the Immich API all the photos from its database 
-one by one, calculate hash codes for all of them and return them to the caller (note that it 
-can take some time if the Immich database is large);
-- Synchronization atomic operations that should be transferred to Immich API:
-  - `/v1/upload` -- Upload a photo missing in the Immich database from the client node;
-  - `/v1/delete` -- Delete an outdated photo from the Immich database;
-  - `/v1/move` -- Move a photo from one album to another;
-  - `/v1/create-album` -- Create a new album;
-  - `/v1/delete-album` -- Delete an album;
-  - `/v1/rename-album` -- Rename album;
+### Main blocks
+1. **Immich backend** — used as a black box via the Immich API, on the server node.
+2. **SyncServer** — the server part of this project, on the server node (same node as
+   Immich). Talks to Immich over the Immich API and to the client over a custom REST API.
+3. **SyncClient** — the client part of this project, on the client machine that owns the
+   local photo tree. Computes the synchronization plan and drives the session.
 
-- `/v1/stop-sync` -- Stop synchronization request to SyncServer;
-SyncServer should disable the current session's one-time API key and start listen to other 
-SyncClients' start synchronization requests (if any).
+### Interaction between the blocks
+- Immich backend ↔ SyncServer: **Immich API**.
+- SyncClient ↔ SyncServer: **custom REST API** (see `design-api.md`).
+
+### Block responsibilities
+#### SyncClient (the "smart" side)
+- Scans the local tree, prepares each image's final metadata (see `design-metadata.md`),
+  and computes a content hash (SHA512 over the **pixel data only**).
+- Validates the local set (no duplicate content across events — a fatal pre-check).
+- Builds the **ordered** list of atomic operations that reconciles local state with remote
+  state (see `design-algorithm.md`).
+- Drives the session: start → collect + poll → apply operations in order → stop.
+
+#### SyncServer (the "dumb translator")
+- Manages a single active sync session via a one-time key with a short inactivity TTL.
+- On collect: reads **every** asset from Immich, downloads its full bytes via
+  `GET /assets/{id}` one by one, decodes each, and computes the **same pixel SHA512**;
+  reconstructs each asset's 7-level position from its embedded metadata; returns
+  `{hash → position}` pairs. **No caching** — the full set is re-downloaded and re-hashed
+  on every sync.
+- Translates each client atomic operation into the corresponding Immich API call, applying
+  them strictly in the client-given order.
+
+## High-level flow
+1. Client prepares `local_pairs = {pixel_hash → 7-level position}` and validates it.
+2. Client → `POST /v1/start-sync` → receives a one-time key.
+3. Client → `POST /v1/collect` → `102` (collection job started).
+4. Client polls `GET /v1/collect/status` → `102` + progress% … → `200` + `remote_pairs`.
+5. Client computes the ordered operation list locally from `local_pairs` + `remote_pairs`.
+6. Client applies each operation in order (one short request per operation).
+7. Client → `POST /v1/stop-sync` → key invalidated, session released.
+
+## Key design decisions
+- **Immich is a black box.** We use its public API only; nothing depends on internals.
+- **Content identity = SHA512 of decoded pixel data** (metadata excluded). Full bytes are
+  re-downloaded and re-hashed on every sync. **No caching** anywhere (for now).
+- **Metadata is flattened into the file.** The 7-level layout exists *only* on the client;
+  before upload the place is merged into the image's metadata (see `design-metadata.md`).
+  Immich only ever sees "pixels + metadata", never the original file path.
+- **The client is the source of truth.** Deleting remote-only photos is automatic, 
+  but before synchronization that involves deleting of remote images, ask user for confirmation.
+- **Only one client / one collection at a time.** Enforced with an atomic session lock.
+- **A crashed sync is resumed by simply re-running it.** Operations are idempotent; a fresh
+  collect makes a re-run converge.
+- **A server restart mid-session is fatal.** All in-flight state (key, collect job,
+  operation progress) is lost by design. The client aborts and the user starts a new sync.
+- **No long blocking HTTP calls.** Long work (collect) is split into "start (102)" + "poll
+  status". The session key has a ~1 minute inactivity TTL so a crashed client never holds
+  the lock forever.
+- **No security for now** beyond an opaque one-time key; security is to be designed
+  separately.
+- **No RAW formats.** jpeg, tiff, png (plus any other format only where pixel-decode is
+  cheap and the metadata write path is already supported).
+
+## Supported formats
+jpeg, tiff, png. No RAW. Additional formats are added only if "decode to pixels + SHA512"
+is cheap and the metadata tooling already supports them.
+
+## Detailed documents
+- `design-metadata.md` — the Place/Metadata model, the per-image upload preparation
+  pipeline, pixel-data hashing, and supported formats.
+- `design-algorithm.md` — the synchronization algorithm: inputs, phases, operation
+  ordering, album identity & same-name collisions, duplicate/empty-album handling, corner
+  cases, and idempotency.
+- `design-api.md` — the SyncServer REST API: endpoints, request/response schemas, the
+  collect/status/poll flow, session-key lifecycle, concurrency & lock atomicity, timeouts,
+  and the failure model.

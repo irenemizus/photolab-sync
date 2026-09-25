@@ -1,3 +1,25 @@
+"""Operation builder for the SyncClient engine (see docs/design-algorithm.md).
+
+This module is part of the **SyncClient** (the smart side). Given the local
+structure and the remote structure collected from SyncServer, it produces the
+complete, **ordered** list of atomic operations that SyncServer (a dumb
+translator) must apply to make the remote side match the local side.
+
+A "structure" is a mapping keyed by the photo's **content hash** (SHA512 over
+the decoded *pixel data* only — metadata is NOT part of the hash) whose value
+describes where that photo lives. See docs/design-algorithm.md §1 for the full
+record model and the discussion of why the current hash->path form is only a
+simplification.
+
+Design constraints the produced plan must satisfy:
+  * any managed-metadata change is a MOVE (even when the album is unchanged);
+  * the ordering is safe to re-apply (idempotent) so a crashed run is completed
+    by simply re-running the sync;
+  * remote-only photos are deleted first (the local tree is the ideal).
+
+Behavioral items marked [TODO] below are specified in docs/design-algorithm.md
+but not yet implemented (this file is the seed, to be extended).
+"""
 import os
 from enum import Enum
 import Levenshtein
@@ -11,6 +33,16 @@ class OperationType(Enum):
     RENAME_ALBUM = 6
 
 class Operation:
+    """One atomic operation SyncServer must apply.
+
+    MOVE semantics (docs/design-algorithm.md §4, docs/design-api.md §6.3): a
+    MOVE is emitted whenever a photo's album changes **or** its metadata
+    changes (same pixels). When only metadata changed, the remote and local
+    "paths" are identical, so the current path-based detection below misses it
+    and the MOVE payload must carry a refreshed file. See [TODO] in
+    build_sync_algorithm.
+    """
+
     def __init__(self, operation_type, remote_path, local_path=None):
         self.operation_type = operation_type
         self.local_path = local_path
@@ -47,6 +79,15 @@ class Operation:
 
 class AlbumHashNames:
     # Constructs from a dictionary where the key is hash and value is filename
+    # (a 7-level path). Albums are keyed by the 4-level prefix
+    # year/month/event/subevent, so two folders sharing the same event-subevent
+    # name but different timing already become distinct keys here.
+    #
+    # [TODO] Per docs/design-algorithm.md §3.3 this is not the whole story:
+    #   * same-name albums are only unambiguous once matched against Immich
+    #     albums (which store a name, not a path) via inferred year/month;
+    #   * the "new year" case (Case B) must MERGE two boundary-adjacent folders
+    #     into a single logical album before this grouping runs.
     def __init__(self, pairs):
         self.__data = dict()
         for hash in pairs.keys():
@@ -75,11 +116,36 @@ def extract_album_name(image_path: str):
     s = image_path.split("/")
     return s[2] + " — " + s[3]
 
-# Assuming the structure is a dict() where the key is a hash,
-# and the value is a tree to the file relative to the photolab root.
+# Input format: each structure is a dict() keyed by the photo's content hash,
+# whose value is the 7-level path to the file relative to the photolab root.
 # Item example:
 #   'fef07ef14141b06370c1f37dd8ad5152f62bafe8f8e435f1ef181c7c82ca1a0618462a7716ba3d82618d92049528606eaf5b36ce48888e2791cd60781c967f2a': '2026/April/Misc/Джаз Sandia Quartet в Бабе-Яге/General/Personal/3 stars/0L5A0599_1.jpg'
 def build_sync_algorithm(local_pairs, remote_pairs):
+    """Build the ordered list of atomic operations for one sync run.
+
+    local_pairs / remote_pairs: hash -> 7-level path (see module docstring).
+    Returns operations ordered as: DELETE, RENAME_ALBUM, CREATE_ALBUM, MOVE,
+    DELETE_ALBUM, UPLOAD (docs/design-algorithm.md §6.1).
+
+    [TODO] The full design (docs/design-algorithm.md) is not yet implemented
+    here; the gaps versus the spec are:
+      * value should be a record (place + full date_time), not just a path, so
+        that a metadata-only change (e.g. day/time within the same month) is
+        detected and emitted as a MOVE;
+      * pre-sync validation: a single pixel hash appearing in more than one
+        local event is a fatal error raised BEFORE any op is returned;
+      * duplicate remote content (same hash, multiple assets) -> keep one,
+        DELETE the rest;
+      * empty local album -> ignored + logged; empty remote album -> kept +
+        logged;
+      * remote image with no event whose hash is local -> MOVE into its album;
+      * same-name album collision: two local folders sharing event-subevent are
+        either two split albums (Case A) or one "new year" merged album (Case B,
+        contiguous across a year boundary); matching uses inferred year/month
+        and albums are addressed by id;
+      * the plan must be idempotent / re-runnable so a crashed sync completes
+        by re-running.
+    """
     remaining_local_pairs = local_pairs.copy()
     remaining_remote_pairs = remote_pairs.copy()
 
@@ -122,6 +188,11 @@ def build_sync_algorithm(local_pairs, remote_pairs):
         remaining_remote_pairs.pop(deleted_remote_hash)
 
     # Step 3a: Finding moved files (the files that exist in both local_hashes and remote_hashes, but have different path)
+    # [TODO] This detects a move only when the *path* (and thus the album or
+    # category/supplemental/rating/year/month) changes. The design requires a
+    # MOVE for ANY metadata change, including a date-time (day/time) change
+    # within the same month where the 7-level path is unchanged. Once the value
+    # is a full record (place + date_time), compare the whole record here.
     moved_hashes = []
     assert(len(remaining_local_pairs) == len(remaining_remote_pairs))
     for local_hash in remaining_local_pairs:
@@ -148,6 +219,13 @@ def build_sync_algorithm(local_pairs, remote_pairs):
     # such local album as a possible new name according to Levenshtein ratio.
     # A local album is a rename candidate only if its name is free on remote:
     # renaming into an already existing album would collide with it
+    # TODO(design-algorithm.md): albums are now keyed by the 4-level identity
+    # year/month/event/subevent, but a rename only changes the event/subevent part.
+    # Re-derive the matching to compare the renameable (event/subevent, i.e. the display
+    # name) while still keying by the full identity; comparing the full 4-level path (as
+    # now) would treat a pure year/month change as a rename. Also handle the
+    # same event/subevent with different timing ("split events" vs "New Year" single
+    # event) and multiple same-named Immich albums.
     rename_candidates = []
     for missing_in_local in sorted(remotes_missing_in_local):
         local_events_containing_images_from_missing_remote = set()

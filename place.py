@@ -2,6 +2,13 @@
 
 Path layout (7 levels above the file name):
     year/month/event/subevent/category/supplemental category/rating
+
+This is a CLIENT-SIDE concept only (see docs/design-metadata.md). It never reaches Immich:
+before upload the place is merged into the image's metadata via
+Metadata.patch_from_place, so the server only ever sees "pixels + metadata".
+
+Levels 1-4 (year/month/event/subevent) form an image's album identity; levels 5-7
+(category/supplemental/rating) are per-photo metadata (see docs/design-algorithm.md).
 """
 
 from pathlib import Path
