@@ -19,6 +19,8 @@ MONTHS = {
     "september": 9, "october": 10, "november": 11, "december": 12,
 }
 
+MONTH_NAMES = {v: k for k, v in MONTHS.items()}
+
 
 class Place:
     def __init__(self,

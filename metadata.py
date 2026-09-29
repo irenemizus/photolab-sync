@@ -90,6 +90,10 @@ class Metadata:
     def write_to_file(self, file_path: Path | str, write_date_time: bool = False):
         with pyexiv2.Image(str(file_path)) as img:
             if write_date_time:
+                if self.date_time_original is None:
+                    raise ValueError(
+                        "date_time_original is not set; the SyncClient's date-time rule "
+                        "(docs/design-metadata.md step 4) guarantees it is set before write")
                 img.modify_exif({
                     "Exif.Photo.DateTimeOriginal": self.date_time_original.strftime(EXIF_DATE_FORMAT),
                 })

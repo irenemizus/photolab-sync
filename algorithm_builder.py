@@ -5,303 +5,259 @@ structure and the remote structure collected from SyncServer, it produces the
 complete, **ordered** list of atomic operations that SyncServer (a dumb
 translator) must apply to make the remote side match the local side.
 
-A "structure" is a mapping keyed by the photo's **content hash** (SHA512 over
-the decoded *pixel data* only — metadata is NOT part of the hash) whose value
-describes where that photo lives. See docs/design-algorithm.md §1 for the full
-record model and the discussion of why the current hash->path form is only a
-simplification.
+The algorithm is pure: it takes two maps and returns an ordered list. No side
+effects, no network access (design-algorithm.md §1).
 
-Design constraints the produced plan must satisfy:
-  * any managed-metadata change is a MOVE (even when the album is unchanged);
-  * the ordering is safe to re-apply (idempotent) so a crashed run is completed
-    by simply re-running the sync;
-  * remote-only photos are deleted first (the local tree is the ideal).
+Inputs (design-algorithm.md §1.1):
 
-Behavioral items marked [TODO] below are specified in docs/design-algorithm.md
-but not yet implemented (this file is the seed, to be extended).
+    local_pairs:  { pixel_sha512_hex : Record }
+    remote_pairs: { pixel_sha512_hex : Record }
+
+The key is the photo's content hash (SHA512 over the decoded pixel data only —
+metadata is NOT part of the hash). The value is the full **Record** (design-
+algorithm.md §1.2): place + full date_time_original. Comparing whole records
+is what makes a metadata-only change (even a day/time change within the same
+month) a MOVE (§4).
+
+`extra_copies` (design-api.md §6.2 "duplicate encoding") lists the additional
+server-side assets sharing a hash: [{"asset_id": ..., "hash": ...}]; each gets
+a targeted DELETE (§5.2).
+
+Design constraints the produced plan must satisfy (design-algorithm.md §6.1):
+  * ordering is DELETE, RENAME_ALBUM, CREATE_ALBUM, MOVE, DELETE_ALBUM, UPLOAD
+    — every operation's preconditions hold when it runs;
+  * the plan is idempotent, so a crashed run is completed by simply re-running
+    the sync (§6.2);
+  * remote-only photos are deleted first (the local tree is the source of
+    truth, §5.2).
+
+Pre-validation of the local set (duplicate content, §7) is done by the
+SyncClient before any session is started; it operates on the raw (hash,
+Record) list because a dict keyed by hash cannot represent a duplicate.
 """
-import os
+
+from dataclasses import dataclass, field
 from enum import Enum
+
 import Levenshtein
 
+from record import EM_DASH, Record
+
+# Section numbers below (e.g. §5.1) refer to docs/design-algorithm.md.
+
+
 class OperationType(Enum):
-    UPLOAD = 1
-    DELETE = 2
-    MOVE = 3
-    CREATE_ALBUM = 4
-    DELETE_ALBUM = 5
-    RENAME_ALBUM = 6
+    UPLOAD = "upload"
+    DELETE = "delete"
+    MOVE = "move"
+    CREATE_ALBUM = "create_album"
+    DELETE_ALBUM = "delete_album"
+    RENAME_ALBUM = "rename_album"
 
+
+class LocalValidationError(Exception):
+    """Fatal pre-check failure: the local set is invalid, the sync must not start (§7)."""
+
+
+@dataclass
 class Operation:
-    """One atomic operation SyncServer must apply.
+    """One atomic operation SyncServer must apply (design-api.md §6.3).
 
-    MOVE semantics (docs/design-algorithm.md §4, docs/design-api.md §6.3): a
-    MOVE is emitted whenever a photo's album changes **or** its metadata
-    changes (same pixels). When only metadata changed, the remote and local
-    "paths" are identical, so the current path-based detection below misses it
-    and the MOVE payload must carry a refreshed file. See [TODO] in
-    build_sync_algorithm.
+    Field usage per type:
+        UPLOAD        hash, record (target; the file bytes are resolved by the
+                      client from its in-memory final files, keyed by hash)
+        DELETE        hash — or asset_id for a server-side duplicate copy (§5.2)
+        MOVE          hash, from_record (current remote record), record (target)
+        CREATE_ALBUM  album (4-level identity), album_name
+        DELETE_ALBUM  album
+        RENAME_ALBUM  album (current identity), album_name (new display name)
+
+    A MOVE is emitted whenever a photo's album changes OR its managed metadata
+    changes (same pixels, §4). The MOVE payload carries the refreshed file
+    bytes (the client's final file) when only metadata changed — same album
+    identity — so the server can update the asset's stored metadata; on an
+    album change the server moves the asset and rewrites metadata from the
+    target record.
     """
 
-    def __init__(self, operation_type, remote_path, local_path=None):
-        self.operation_type = operation_type
-        self.local_path = local_path
-        self.remote_path = remote_path
+    operation_type: OperationType
+    hash: str | None = None
+    asset_id: str | None = None
+    record: Record | None = None
+    from_record: Record | None = None
+    album: tuple | None = None
+    album_name: str | None = None
 
-    def __str__(self):
-        if self.operation_type == OperationType.UPLOAD:
-            return f"UPLOAD: {self.remote_path}"
-        elif self.operation_type == OperationType.DELETE:
-            return f"DELETE: {self.remote_path}"
-        elif self.operation_type == OperationType.MOVE:
-            return f"MOVE: {self.remote_path} -> {self.local_path}"
-        elif self.operation_type == OperationType.CREATE_ALBUM:
-            return f"CREATE_ALBUM: {self.remote_path}"
-        elif self.operation_type == OperationType.DELETE_ALBUM:
-            return f"DELETE_ALBUM: {self.remote_path}"
-        elif self.operation_type == OperationType.RENAME_ALBUM:
-            return f"RENAME_ALBUM: {self.remote_path} -> {self.local_path}"
-        else:
-            return None
-
-
-# This structure contains a tree of pictures in the following format:
-# {
-#     ("event1", "subevent1"): (
-#         "1a8b53...": "filename1.jpg",
-#         "c9d8e7...": "filename2.jpg"
-#     ),
-#     ("event2", "subevent2"): (
-#         "qwe876...": "filename3.jpg",
-#         "a4s5d6...": "filename4.jpg"
-#     )
-# }
-
-class AlbumHashNames:
-    # Constructs from a dictionary where the key is hash and value is filename
-    # (a 7-level path). Albums are keyed by the 4-level prefix
-    # year/month/event/subevent, so two folders sharing the same event-subevent
-    # name but different timing already become distinct keys here.
-    #
-    # [TODO] Per docs/design-algorithm.md §3.3 this is not the whole story:
-    #   * same-name albums are only unambiguous once matched against Immich
-    #     albums (which store a name, not a path) via inferred year/month;
-    #   * the "new year" case (Case B) must MERGE two boundary-adjacent folders
-    #     into a single logical album before this grouping runs.
-    def __init__(self, pairs):
-        self.__data = dict()
-        for hash in pairs.keys():
-            year = pairs[hash].split("/")[0]
-            month = pairs[hash].split("/")[1]
-            event_name = pairs[hash].split("/")[2]
-            subevent_name = pairs[hash].split("/")[3]
-            key = os.path.join(year, month, event_name, subevent_name)
-            if key not in self.__data:
-                self.__data[key] = set()
-
-            self.__data[key].add((hash, pairs[hash]))
-
-    def get_event_names(self):
-        return list(self.__data.keys())
-
-    def get_pairs_for(self, event_name):
-        return self.__data[event_name]
+    def __str__(self) -> str:
+        h = self.hash
+        hshort = f"{h[:12]}…" if h else (self.asset_id or "?")
+        if self.operation_type is OperationType.UPLOAD:
+            return f"UPLOAD {hshort} -> {self.record}"
+        if self.operation_type is OperationType.DELETE:
+            return f"DELETE {hshort}"
+        if self.operation_type is OperationType.MOVE:
+            return f"MOVE {hshort} {self.from_record} -> {self.record}"
+        if self.operation_type is OperationType.CREATE_ALBUM:
+            return f"CREATE_ALBUM {self.album} ({self.album_name})"
+        if self.operation_type is OperationType.DELETE_ALBUM:
+            return f"DELETE_ALBUM {self.album}"
+        if self.operation_type is OperationType.RENAME_ALBUM:
+            return f"RENAME_ALBUM {self.album} -> {self.album_name}"
+        return f"OP {self.operation_type} {hshort}"
 
 
-def extract_album_path(image_path: str):
-    s = image_path.split("/")
-    return s[0] + "/" + s[1] + "/" + s[2] + "/" + s[3]
+def validate_local_pairs(pairs: list[tuple[str, Record]]) -> None:
+    """Fatal pre-check on the local set (design-algorithm.md §7).
 
-def extract_album_name(image_path: str):
-    s = image_path.split("/")
-    return s[2] + " — " + s[3]
+    `pairs` is the raw scan result: one (hash, record) per local image, BEFORE
+    deduplication into a dict. A single pixel hash MUST map to exactly one
+    record. If the same hash appears more than once — under a different record
+    (a photo in two events) or even under the same record (a plain duplicate
+    file) — this is FATAL and the sync does not start.
 
-# Input format: each structure is a dict() keyed by the photo's content hash,
-# whose value is the 7-level path to the file relative to the photolab root.
-# Item example:
-#   'fef07ef14141b06370c1f37dd8ad5152f62bafe8f8e435f1ef181c7c82ca1a0618462a7716ba3d82618d92049528606eaf5b36ce48888e2791cd60781c967f2a': '2026/April/Misc/Джаз Sandia Quartet в Бабе-Яге/General/Personal/3 stars/0L5A0599_1.jpg'
-def build_sync_algorithm(local_pairs, remote_pairs):
+    Server-side duplicates are NOT a pre-check (§5.2): they are resolved
+    during the plan, so a server-side duplicate must not by itself abort a
+    sync.
+    """
+    seen: dict[str, Record] = {}
+    for h, record in pairs:
+        if h in seen:
+            if seen[h] == record:
+                raise LocalValidationError(
+                    f"duplicate content: pixel hash {h[:16]}… appears twice with the "
+                    f"same record ({record}) — duplicates are not tolerated"
+                )
+            raise LocalValidationError(
+                f"duplicate content: pixel hash {h[:16]}… is in two events: "
+                f"{seen[h]} and {record}"
+            )
+        seen[h] = record
+
+
+def build_sync_algorithm(
+    local_pairs: dict[str, Record],
+    remote_pairs: dict[str, Record],
+    extra_copies: list[dict] | None = None,
+) -> list[Operation]:
     """Build the ordered list of atomic operations for one sync run.
 
-    local_pairs / remote_pairs: hash -> 7-level path (see module docstring).
-    Returns operations ordered as: DELETE, RENAME_ALBUM, CREATE_ALBUM, MOVE,
-    DELETE_ALBUM, UPLOAD (docs/design-algorithm.md §6.1).
+    local_pairs / remote_pairs: hash -> Record (design-algorithm.md §1.1-1.2).
+    extra_copies: server-side duplicate assets [{"asset_id", "hash"}] reported
+    by the collect (design-api.md §6.2); each yields a targeted DELETE.
 
-    [TODO] The full design (docs/design-algorithm.md) is not yet implemented
-    here; the gaps versus the spec are:
-      * value should be a record (place + full date_time), not just a path, so
-        that a metadata-only change (e.g. day/time within the same month) is
-        detected and emitted as a MOVE;
-      * pre-sync validation: a single pixel hash appearing in more than one
-        local event is a fatal error raised BEFORE any op is returned;
-      * duplicate remote content (same hash, multiple assets) -> keep one,
-        DELETE the rest;
-      * empty local album -> ignored + logged; empty remote album -> kept +
-        logged;
-      * remote image with no event whose hash is local -> MOVE into its album;
-      * same-name album collision: two local folders sharing event-subevent are
-        either two split albums (Case A) or one "new year" merged album (Case B,
-        contiguous across a year boundary); matching uses inferred year/month
-        and albums are addressed by id;
-      * the plan must be idempotent / re-runnable so a crashed sync completes
-        by re-running.
+    Returns operations ordered as DELETE, RENAME_ALBUM, CREATE_ALBUM, MOVE,
+    DELETE_ALBUM, UPLOAD (§6.1). Pure: no side effects, no network access.
     """
-    remaining_local_pairs = local_pairs.copy()
-    remaining_remote_pairs = remote_pairs.copy()
+    extra_copies = extra_copies or []
 
-    # Collecting the albums of all the local hashes
-    local_albums_pics = AlbumHashNames(local_pairs)
-    local_event_names = local_albums_pics.get_event_names()
+    # --- §5.2 removed content -> DELETE (first; the client is authoritative) ---
+    deletions = [
+        # Targeted by the server-side asset_id, not the hash: the hash maps
+        # to the primary (kept) copy, the extra one is addressed by id (§5.2).
+        Operation(OperationType.DELETE, asset_id=copy["asset_id"])
+        for copy in extra_copies
+    ]
+    for h in sorted(set(remote_pairs) - set(local_pairs)):
+        deletions.append(Operation(OperationType.DELETE, hash=h))
 
-    # Collecting the albums of all the remote hashes
-    remote_albums_pics = AlbumHashNames(remote_pairs)
-    remote_event_names = remote_albums_pics.get_event_names()
+    # --- §5.1 new content -> UPLOAD ---
+    uploads = [
+        Operation(OperationType.UPLOAD, hash=h, record=local_pairs[h])
+        for h in sorted(set(local_pairs) - set(remote_pairs))
+    ]
 
-    # Step 1: Finding new files
-    # Check what hashes exist in local_hashes, but not in remote_hashes
-    new_local_hashes = remaining_local_pairs.keys() - remaining_remote_pairs.keys()
+    # --- §5.3 moved / metadata-changed -> MOVE ---
+    common = set(local_pairs) & set(remote_pairs)
+    moves = [
+        Operation(OperationType.MOVE, hash=h, from_record=remote_pairs[h], record=local_pairs[h])
+        for h in sorted(common)
+        if local_pairs[h] != remote_pairs[h]
+    ]
 
-    print(f"New hashes count: {len(new_local_hashes)}")
+    # --- §3.2 album create / rename / delete ---
+    local_albums = {r.album_identity for r in local_pairs.values() if r.album_identity}
+    remote_albums = {r.album_identity for r in remote_pairs.values() if r.album_identity}
 
+    # Reverse index: hash -> local album identity (O(1) lookup of where a
+    # remote album's pictures ended up).
+    local_album_by_hash = {
+        h: r.album_identity for h, r in local_pairs.items() if r.album_identity
+    }
 
-    # Adding UPLOAD operation for each new file
-    uploading_operations = []
-    for new_local_hash in new_local_hashes:
-        uploading_operations.append(Operation(OperationType.UPLOAD, remaining_local_pairs[new_local_hash]))
-
-    # Erasing all new_local_hashes from local_hashes
-    for new_hash in new_local_hashes:
-        remaining_local_pairs.pop(new_hash)
-
-    # Step 2: Finding deleted files
-    # Check what hashes exist in remote_hashes, but don't exist in local_hashes
-    deleted_remote_hashes = remaining_remote_pairs.keys() - remaining_local_pairs.keys()
-    print(f"Deleted hashes count: {len(deleted_remote_hashes)}")
-
-    # Adding DELETE operation for each deleted old file
-    deletion_operations = []
-    for deleted_remote_hash in deleted_remote_hashes:
-        deletion_operations.append(Operation(OperationType.DELETE, remaining_remote_pairs[deleted_remote_hash]))
-
-    # Erasing all the deleted_remote_hashes from remote_hashes
-    for deleted_remote_hash in deleted_remote_hashes:
-        remaining_remote_pairs.pop(deleted_remote_hash)
-
-    # Step 3a: Finding moved files (the files that exist in both local_hashes and remote_hashes, but have different path)
-    # [TODO] This detects a move only when the *path* (and thus the album or
-    # category/supplemental/rating/year/month) changes. The design requires a
-    # MOVE for ANY metadata change, including a date-time (day/time) change
-    # within the same month where the 7-level path is unchanged. Once the value
-    # is a full record (place + date_time), compare the whole record here.
-    moved_hashes = []
-    assert(len(remaining_local_pairs) == len(remaining_remote_pairs))
-    for local_hash in remaining_local_pairs:
-        if remaining_remote_pairs[local_hash] != remaining_local_pairs[local_hash]:
-            moved_hashes.append(local_hash)
-
-    # Collecting remote albums that are missing in local
-    remotes_missing_in_local = set()
-    for remote_event in remote_event_names:
-        found = False
-        for local_event in local_event_names:
-            if local_event == remote_event:
-                found = True
-        if not found:
-            remotes_missing_in_local.add(remote_event)
-
-    # Reverse index (hash -> local album) so that, for a remote album's pictures,
-    # the local album they ended up in can be looked up in O(1) instead of
-    # rescanning every local album's pictures for each one
-    local_album_by_hash = {hash: extract_album_path(path) for hash, path in local_pairs.items()}
-
-    # For each remote missing in local, collecting list of local albums
-    # containing former pictures from this remote album, and rating every
-    # such local album as a possible new name according to Levenshtein ratio.
-    # A local album is a rename candidate only if its name is free on remote:
-    # renaming into an already existing album would collide with it
-    # TODO(design-algorithm.md): albums are now keyed by the 4-level identity
-    # year/month/event/subevent, but a rename only changes the event/subevent part.
-    # Re-derive the matching to compare the renameable (event/subevent, i.e. the display
-    # name) while still keying by the full identity; comparing the full 4-level path (as
-    # now) would treat a pure year/month change as a rename. Also handle the
-    # same event/subevent with different timing ("split events" vs "New Year" single
-    # event) and multiple same-named Immich albums.
+    # RENAME candidates: for each remote identity missing locally, the local
+    # albums containing its former pictures are candidates, scored by the
+    # similarity ratio of the renameable part — the display name
+    # (event — subevent), not the full 4-level identity.
+    #
+    # A rename only changes the event/subevent part; the server keeps the
+    # source identity's year/month and updates its identity mapping
+    # (design-api.md §6.3). So a candidate is usable only if it shares the
+    # source's year/month (a pure year/month change is NOT a rename — it is
+    # create + delete, §3.2) and its identity is free on the remote side
+    # (renaming into an existing album would collide).
     rename_candidates = []
-    for missing_in_local in sorted(remotes_missing_in_local):
-        local_events_containing_images_from_missing_remote = set()
-        for pair_from_missing in remote_albums_pics.get_pairs_for(missing_in_local):
-            local_event = local_album_by_hash.get(pair_from_missing[0])
-            if local_event is not None:
-                local_events_containing_images_from_missing_remote.add(local_event)
-
-        for successor_album in local_events_containing_images_from_missing_remote:
-            if successor_album in remote_event_names:
+    for missing in sorted(remote_albums - local_albums):
+        names = _album_name(remote_pairs, missing)
+        candidate_albums = set()
+        for h, r in remote_pairs.items():
+            if r.album_identity == missing and h in local_album_by_hash:
+                candidate_albums.add(local_album_by_hash[h])
+        for candidate in candidate_albums:
+            if candidate in remote_albums:
                 continue
-            rename_candidates.append((Levenshtein.ratio(successor_album, missing_in_local),
-                                      missing_in_local,
-                                      successor_album))
+            if (candidate[0], candidate[1]) != (missing[0], missing[1]):
+                continue
+            ratio = Levenshtein.ratio(_display_name(*candidate[2:]), names)
+            rename_candidates.append((ratio, missing, candidate))
 
-    # Picking the renames greedily, the best ratio first, so that no album is
-    # renamed twice and no two albums are renamed into the same target name.
-    # The names are a part of the sorting key to keep the result stable
-    rename_candidates.sort(key=lambda candidate: (-candidate[0], candidate[1], candidate[2]))
-    album_renames = dict()  # remote album name -> new (local) album name
-    taken_target_names = set()
-    for lratio, source_album, target_album in rename_candidates:
-        if source_album in album_renames or target_album in taken_target_names:
+    # Greedy best-match: best ratio first; no album is renamed twice and no two
+    # albums are renamed into the same target. The names break ties stably.
+    rename_candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    album_renames: dict[tuple, tuple] = {}   # source identity -> target identity
+    taken_target_ids: set[tuple] = set()
+    for ratio, source, target in rename_candidates:
+        if source in album_renames or target in taken_target_ids:
             continue
-        album_renames[source_album] = target_album
-        taken_target_names.add(target_album)
+        album_renames[source] = target
+        taken_target_ids.add(target)
 
-    album_rename_operations = []
-    for source_album in album_renames:
-        album_rename_operations.append(Operation(OperationType.RENAME_ALBUM, source_album, album_renames[source_album]))
+    rename_ops = [
+        Operation(OperationType.RENAME_ALBUM, album=source,
+                  album_name=_display_name(*album_renames[source][2:]))
+        for source in sorted(album_renames)
+    ]
 
-    # The remote albums missing in local that got no free successor name are deleted.
-    # Their surviving pictures are moved out one by one before the deletion
-    album_deletion_operations = []
-    for missing_in_local in sorted(remotes_missing_in_local):
-        if missing_in_local not in album_renames:
-            album_deletion_operations.append(Operation(OperationType.DELETE_ALBUM, missing_in_local))
+    # CREATE: a local identity not in remote_albums and not a rename target
+    # (a rename target exists remotely under its old identity — creating it
+    # again would yield a duplicate album with the same display name).
+    rename_targets = set(album_renames.values())
+    create_ops = [
+        Operation(OperationType.CREATE_ALBUM, album=identity,
+                  album_name=_display_name(*identity[2:]))
+        for identity in sorted(local_albums - remote_albums - rename_targets)
+    ]
 
-    renamed_albums = list(album_renames.values())
+    # DELETE_ALBUM: a remote identity missing locally and not renamed, emitted
+    # after its surviving photos have been moved out (moves run before
+    # deletions, §6.1). Empty remote albums are kept as-is (§8).
+    delete_album_ops = [
+        Operation(OperationType.DELETE_ALBUM, album=identity)
+        for identity in sorted(remote_albums - local_albums - set(album_renames))
+    ]
 
-    # Adding single file movement operations for the files that are moved one by one, not by renaming the album.
-    # The album renames are applied to the remote paths first, since the renames are executed before the movements
-    movement_operations = []
-    for hash_to_move in moved_hashes:
-        remote_path = remaining_remote_pairs[hash_to_move]
-        local_path = remaining_local_pairs[hash_to_move]
-        remote_album = extract_album_path(remote_path)
-        if remote_album in album_renames:
-            remote_path = album_renames[remote_album] + remote_path[len(remote_album):]
-        if remote_path != local_path:
-            movement_operations.append(Operation(OperationType.MOVE, remote_path, local_path))
-
-
-    # Adding CREATE_ALBUM operation for each new file's album that is missing on remote and wasn't renamed
-    album_creation_operations = []
-    created_albums = set()
-    for local_hash in local_pairs.keys():
-        local_image_path = local_pairs[local_hash]
-        local_image_album = extract_album_path(local_image_path)
-        if not local_image_album in renamed_albums and not local_image_album in created_albums:
-            if local_image_album in local_albums_pics.get_event_names():
-                found = False
-                for remote_album in remote_albums_pics.get_event_names():
-                    if local_image_album == remote_album:
-                        found = True
-                        break
-                if not found:
-                    album_creation_operations.append(Operation(OperationType.CREATE_ALBUM, local_image_album))
-                    created_albums.add(local_image_album)
+    # The order matters (part of the contract, §6.1): photos are deleted first,
+    # albums are renamed and created before photos are moved into them, and an
+    # old album is deleted only after its surviving photos have been moved out.
+    return deletions + rename_ops + create_ops + moves + delete_album_ops + uploads
 
 
-    # The order matters: the albums are renamed and created before the files are moved into them,
-    # and an old album is deleted only after its surviving files have been moved out of it
-    return deletion_operations + \
-           album_rename_operations + \
-           album_creation_operations + \
-           movement_operations + \
-           album_deletion_operations + \
-           uploading_operations
+def _album_name(remote_pairs: dict[str, Record], identity: tuple) -> str:
+    """The display name of a remote album, from any of its records."""
+    for r in remote_pairs.values():
+        if r.album_identity == identity:
+            return _display_name(r.event, r.subevent)
+    return _display_name(identity[2], identity[3])
+
+
+def _display_name(event, subevent) -> str:
+    return f"{event or ''}{EM_DASH}{subevent or ''}".strip()
