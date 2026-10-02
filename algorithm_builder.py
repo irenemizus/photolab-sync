@@ -10,14 +10,15 @@ effects, no network access (design-algorithm.md §1).
 
 Inputs (design-algorithm.md §1.1):
 
-    local_pairs:  { pixel_sha512_hex : Record }
-    remote_pairs: { pixel_sha512_hex : Record }
+    local_pairs:  { content_sha512_hex : Record }
+    remote_pairs: { content_sha512_hex : Record }
 
-The key is the photo's content hash (SHA512 over the decoded pixel data only —
-metadata is NOT part of the hash). The value is the full **Record** (design-
-algorithm.md §1.2): place + full date_time_original. Comparing whole records
-is what makes a metadata-only change (even a day/time change within the same
-month) a MOVE (§4).
+The key is the photo's content hash (SHA512 over the raw file bytes — pixels,
+container, and metadata are ALL part of the hash). The value is the full
+**Record** (design-algorithm.md §1.2): place + full date_time_original. A file
+change (pixels, metadata, or encoding) yields a new hash, so it is a
+DELETE(old) + UPLOAD(new) — a MOVE fires only when byte-identical files carry
+different records (§4).
 
 `extra_copies` (design-api.md §6.2 "duplicate encoding") lists the additional
 server-side assets sharing a hash: [{"asset_id": ..., "hash": ...}]; each gets
@@ -72,12 +73,11 @@ class Operation:
         DELETE_ALBUM  album
         RENAME_ALBUM  album (current identity), album_name (new display name)
 
-    A MOVE is emitted whenever a photo's album changes OR its managed metadata
-    changes (same pixels, §4). The MOVE payload carries the refreshed file
-    bytes (the client's final file) when only metadata changed — same album
-    identity — so the server can update the asset's stored metadata; on an
-    album change the server moves the asset and rewrites metadata from the
-    target record.
+    A MOVE is emitted when byte-identical files (same content hash) carry
+    different records (§4). A file change (pixels, metadata, or encoding) yields
+    a new hash and is a DELETE(old) + UPLOAD(new), not a MOVE. The MOVE payload
+    carries the refreshed file bytes (the client's final file) so the server can
+    update the asset's stored metadata.
     """
 
     operation_type: OperationType
@@ -110,7 +110,7 @@ def validate_local_pairs(pairs: list[tuple[str, Record]]) -> None:
     """Fatal pre-check on the local set (design-algorithm.md §7).
 
     `pairs` is the raw scan result: one (hash, record) per local image, BEFORE
-    deduplication into a dict. A single pixel hash MUST map to exactly one
+    deduplication into a dict. A single content hash MUST map to exactly one
     record. If the same hash appears more than once — under a different record
     (a photo in two events) or even under the same record (a plain duplicate
     file) — this is FATAL and the sync does not start.
@@ -124,11 +124,11 @@ def validate_local_pairs(pairs: list[tuple[str, Record]]) -> None:
         if h in seen:
             if seen[h] == record:
                 raise LocalValidationError(
-                    f"duplicate content: pixel hash {h[:16]}… appears twice with the "
+                    f"duplicate content: content hash {h[:16]}… appears twice with the "
                     f"same record ({record}) — duplicates are not tolerated"
                 )
             raise LocalValidationError(
-                f"duplicate content: pixel hash {h[:16]}… is in two events: "
+                f"duplicate content: content hash {h[:16]}… is in two events: "
                 f"{seen[h]} and {record}"
             )
         seen[h] = record

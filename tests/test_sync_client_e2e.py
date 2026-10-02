@@ -16,8 +16,8 @@ from pathlib import Path
 import pyexiv2
 from PIL import Image
 
+from content_hash import compute_content_hash
 from metadata import Metadata
-from pixel_hash import compute_pixel_hash
 from stub_sync_server import TestStubSyncServer
 from sync_client import OperationType, SyncClient
 
@@ -50,8 +50,10 @@ def _tree(root: Path) -> dict[str, str]:
 def test_full_sync_against_empty_stub(tmp_path):
     root = tmp_path / "photos"
     rel = _tree(root)
-    pixels_before = {name: compute_pixel_hash((root / rel).read_bytes())
-                     for name, rel in rel.items()}
+    # Content hashing changes the file bytes (metadata is written back), so
+    # "pixels intact" is checked by comparing decoded RGB, not file hashes.
+    pixels_before = {name: Image.open(root / relpath).convert("RGB").tobytes()
+                     for name, relpath in rel.items()}
 
     with TestStubSyncServer() as server:
         client = SyncClient(root, server.url, poll_interval=0)
@@ -68,11 +70,13 @@ def test_full_sync_against_empty_stub(tmp_path):
     uploads = server.state.uploads
     assert len(uploads) == 3
 
-    # the stub keys uploads by the real pixel hash (unique per file); the
-    # two april photos share one album, so the album cannot be used as a key.
-    a_up = uploads[pixels_before["a"]]
-    b_up = uploads[pixels_before["b"]]
-    c_up = uploads[pixels_before["c"]]
+    # the stub keys uploads by the content hash of the FINAL (augmented) file;
+    # after the sync the local files ARE the augmented files, so their hashes
+    # are the upload keys (the two april photos share one album, so the album
+    # cannot be used as a key).
+    a_up = uploads[compute_content_hash((root / rel["a"]).read_bytes())]
+    b_up = uploads[compute_content_hash((root / rel["b"]).read_bytes())]
+    c_up = uploads[compute_content_hash((root / rel["c"]).read_bytes())]
 
     assert a_up["record"] == {
         "year": 2026, "month": 4, "event": "Beach", "subevent": "Sunset",
@@ -113,7 +117,7 @@ def test_full_sync_against_empty_stub(tmp_path):
     assert md_c.date_time_original == datetime(2026, 5, 31, 8, 15, 0)
 
     for name, r in rel.items():
-        assert compute_pixel_hash((root / r).read_bytes()) == pixels_before[name]
+        assert Image.open(root / r).convert("RGB").tobytes() == pixels_before[name]
 
     # no temp files were left behind
     assert list(root.rglob("*.tmp")) == []
@@ -129,12 +133,12 @@ def test_session_call_sequence(tmp_path):
 
     paths = [c["path"] for c in server.state.requests_log]
     assert paths == [
-        "/v1/start-sync",
+        "/v1/sync/start",
         "/v1/collect",
         "/v1/collect/status",
         # CREATE_ALBUM precedes UPLOAD (§6.1); two distinct albums
-        "/v1/create-album", "/v1/create-album",
+        "/v1/album/create", "/v1/album/create",
         "/v1/upload", "/v1/upload", "/v1/upload",
-        "/v1/stop-sync",
+        "/v1/sync/stop",
     ]
-    assert all(c["status"] in (102, 200) for c in server.state.requests_log)
+    assert all(c["status"] in (202, 200) for c in server.state.requests_log)

@@ -104,15 +104,7 @@ class TestStubSyncServer:
                     return None
 
             def _send(self, status: int, payload: dict) -> None:
-                if 100 <= status < 200:
-                    # 1xx informational responses carry no body (RFC 9110 §9.2), so the
-                    # spec's 102 body (job id / progress) is not transmitted; the client
-                    # keys off the status code instead. Sending no body also keeps the
-                    # keep-alive connection in sync.
-                    self.send_response(status)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
+                # Every response is a 2xx with a JSON body (no 1xx in the spec).
                 data = json.dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -207,7 +199,7 @@ class _ApiError(Exception):
 # -- endpoint handlers ---------------------------------------------------------
 
 def _ep_start_sync(handler, state: _ServerState, body) -> tuple[int, dict]:
-    """POST /v1/start-sync — atomically idle -> active (§6.1)."""
+    """POST /v1/sync/start — atomically idle -> active (§6.1)."""
     with state.lock:
         if state.active_key is not None:
             if time.monotonic() >= state.key_expires_at:
@@ -232,7 +224,7 @@ def _ep_collect(handler, state: _ServerState, body) -> tuple[int, dict]:
         job = uuid.uuid4().hex
         state.collect_job = job
         state.collect_done_polls = 0
-    return 102, {"job": job, "status": "running"}
+    return 202, {"job": job, "status": "running", "progress": 0.0}
 
 
 def _ep_collect_status(handler, state: _ServerState, body) -> tuple[int, dict]:
@@ -247,8 +239,9 @@ def _ep_collect_status(handler, state: _ServerState, body) -> tuple[int, dict]:
             raise _ApiError(404, "no_collection", "no collection has been started")
         if state.collect_done_polls < state.running_polls_before_done:
             state.collect_done_polls += 1
-            progress = min(99, state.collect_done_polls * 50)
-            return 102, {"status": "running", "progress": progress}
+            # progress is a 0.0..1.0 fraction, monotonic, <1.0 until done.
+            progress = min(0.99, state.collect_done_polls * 0.5)
+            return 202, {"status": "running", "progress": progress}
         state.collect_job = None
         return 200, {"status": "done", "result": {}, "extra_copies": []}
 
@@ -294,35 +287,35 @@ def _ep_move(handler, state: _ServerState, body) -> tuple[int, dict]:
 
 
 def _ep_create_album(handler, state: _ServerState, body) -> tuple[int, dict]:
-    """POST /v1/create-album (§6.3)."""
+    """POST /v1/album/create (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
-        raise _ApiError(400, "bad_request", "create-album body must carry an identity")
+        raise _ApiError(400, "bad_request", "album/create body must carry an identity")
     return 200, {"ok": True, "identity": body["identity"], "name": body.get("name")}
 
 
 def _ep_delete_album(handler, state: _ServerState, body) -> tuple[int, dict]:
-    """POST /v1/delete-album (§6.3)."""
+    """POST /v1/album/delete (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
-        raise _ApiError(400, "bad_request", "delete-album body must carry an identity")
+        raise _ApiError(400, "bad_request", "album/delete body must carry an identity")
     return 200, {"ok": True, "identity": body["identity"]}
 
 
 def _ep_rename_album(handler, state: _ServerState, body) -> tuple[int, dict]:
-    """POST /v1/rename-album (§6.3)."""
+    """POST /v1/album/rename (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
-        raise _ApiError(400, "bad_request", "rename-album body must carry an identity")
+        raise _ApiError(400, "bad_request", "album/rename body must carry an identity")
     return 200, {"ok": True, "identity": body["identity"],
                  "new_name": body.get("new_name")}
 
 
 def _ep_stop_sync(handler, state: _ServerState, body) -> tuple[int, dict]:
-    """POST /v1/stop-sync — invalidate the key, slot back to idle (§6.4)."""
+    """POST /v1/sync/stop — invalidate the key, slot back to idle (§6.4)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     with state.lock:
@@ -332,16 +325,16 @@ def _ep_stop_sync(handler, state: _ServerState, body) -> tuple[int, dict]:
 
 
 _ENDPOINTS = {
-    ("POST", "/v1/start-sync"): _ep_start_sync,
+    ("POST", "/v1/sync/start"): _ep_start_sync,
     ("POST", "/v1/collect"): _ep_collect,
     ("GET", "/v1/collect/status"): _ep_collect_status,
     ("POST", "/v1/upload"): _ep_upload,
     ("POST", "/v1/delete"): _ep_delete,
     ("POST", "/v1/move"): _ep_move,
-    ("POST", "/v1/create-album"): _ep_create_album,
-    ("POST", "/v1/delete-album"): _ep_delete_album,
-    ("POST", "/v1/rename-album"): _ep_rename_album,
-    ("POST", "/v1/stop-sync"): _ep_stop_sync,
+    ("POST", "/v1/album/create"): _ep_create_album,
+    ("POST", "/v1/album/delete"): _ep_delete_album,
+    ("POST", "/v1/album/rename"): _ep_rename_album,
+    ("POST", "/v1/sync/stop"): _ep_stop_sync,
 }
 
 

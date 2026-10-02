@@ -19,12 +19,12 @@ Section numbers here are stable and are referenced from code comments (`§…`).
 The algorithm takes two maps (a "structure" is one of these maps):
 
 ```
-local_pairs:  { pixel_sha512_hex : record }
-remote_pairs: { pixel_sha512_hex : record }
+local_pairs:  { content_sha512_hex : record }
+remote_pairs: { content_sha512_hex : record }
 ```
 
-- **Key** = the photo's **content hash**: SHA512 over the decoded **pixel data only**
-  (metadata is **not** part of the hash; see `design-metadata.md`).
+- **Key** = the photo's **content hash**: SHA512 over the **raw file bytes** (pixels,
+  container, and metadata are **all** part of the hash; see `design-metadata.md`).
 - **Value** = a **record** describing where the photo lives and its managed metadata
   (§1.2). The current code uses a *path string* as the value; that is a simplification
   (§1.3).
@@ -67,13 +67,13 @@ implemented, path comparison is a best-effort approximation.
 
 ### 2.1 Local
 - Walk the tree; for each supported image run the upload-preparation pipeline
-  (`design-metadata.md`) to obtain (a) the pixel hash and (b) the **record** (the
+  (`design-metadata.md`) to obtain (a) the content hash and (b) the **record** (the
   place parsed from the path, plus the file's `date_time_original` and managed metadata).
 - Collect into `local_pairs`.
 
 ### 2.2 Remote (from the collect)
-- The server reads every asset, downloads its full bytes (`GET /assets/{id}`), hashes the
-  pixels, and reconstructs the **record** from the asset's **embedded metadata**
+- The server reads every asset, downloads its full bytes (`GET /assets/{id}`), hashes them,
+  and reconstructs the **record** from the asset's **embedded metadata**
   (`year/month`/day/time from `date_time_original`; `event/subevent/category/supplemental/
   rating` from XMP/IPTC).
 - The result is returned to the client as `remote_pairs` (`design-api.md §6.2`).
@@ -142,21 +142,24 @@ specified.
     merge rule + anchor rule. Until decided, **Case A is the safe default.**
 
 ## 4. MOVE semantics
-A **MOVE** is emitted whenever a photo's **album changes OR its managed metadata changes**
-(same pixels). Concretely, for a hash present on both sides, if the two **records** differ
-in any field (§1.2), emit `MOVE(hash, from=remote_record, to=local_record)`.
+A **MOVE** is emitted for a content hash (i.e. **identical file bytes**) present on
+**both** sides when the two **records** differ in any field (§1.2):
+`MOVE(hash, from=remote_record, to=local_record)`.
 
-- A MOVE covers moving between **albums** (4-level identity changes) **and** any metadata
-  change (`category`/`supplemental`/`rating`/`event`/`subevent`/`date_time_original`) even
-  when the album is unchanged.
-- **Product rule:** unchanged pixels + changed metadata ⇒ **always** a MOVE — even if
-  `event/subevent` are unchanged (e.g. only the rating changed, or only the day/time
-  changed within the same month).
-- When only metadata changed (same album, same path), the MOVE must still update the
-  asset's stored metadata on the server; the MOVE payload therefore carries the refreshed
-  metadata/file (`design-api.md §6.3`).
-- **Pixel-only change** (different pixels, same position) is **not** a move: the old hash
-  disappears (§5.2 → DELETE) and the new hash appears (§5.1 → UPLOAD).
+Because the content hash is over the **whole file** (`design-metadata.md`), a change to the
+file — pixels **or** metadata **or** encoding — yields a **new** hash. Such a change is a
+`DELETE` (old hash, §5.2) + `UPLOAD` (new hash, §5.1), **not** a MOVE. In particular:
+
+- **Metadata-only change** (re-rating, re-encoding, a day/time change within the same
+  month, re-filing into a folder that rewrites tags): the file bytes change ⇒ the hash
+  changes ⇒ `DELETE` + `UPLOAD`.
+- **Pixel-only change** (re-photograph / edit, same position): same ⇒ `DELETE` + `UPLOAD`.
+
+A MOVE therefore only fires when **byte-identical** files carry **different** records — a
+narrow case (e.g. the remote record reconstructed from embedded metadata diverges from the
+local record for the very same file). When a MOVE does fire, it must still update the asset's
+stored metadata on the server; the payload carries the refreshed file
+(`design-api.md §6.3`).
 
 ## 5. Reconciling content (the phases)
 Let `L = local_pairs`, `R = remote_pairs`. Work on copies so the originals stay for
@@ -172,7 +175,7 @@ reporting.
 - **Remote-only photos are deleted first and unconditionally.** The client is the ideal /
   source of truth; the user has no qualified per-photo decision and is always assumed to
   answer "yes". No confirmation prompt.
-- **Server-side duplicates:** if `R` holds the **same** pixel hash under **two or more**
+- **Server-side duplicates:** if `R` holds the **same** content hash under **two or more**
   assets, keep **one** copy and emit `DELETE` for the **extra** copies (targeted by the
   server-side `asset_id`, not just the hash). Net effect after the sync: **exactly one**
   copy of a duplicated hash survives.
@@ -181,10 +184,13 @@ reporting.
   - `TODO`: finalize how collect reports "same hash, N assets" (recommend: primary record
     keyed by hash + a list of extra `asset_id`s to delete).
 
-### 5.3 Moved / metadata-changed → MOVE
+### 5.3 Common content, differing record → MOVE
 - For each `h in set(L.keys()) & set(R.keys())`:
   - if `L[h] != R[h]` (records differ, §4): emit `MOVE(h, from=R[h], to=L[h])`.
   - else: no operation (already consistent).
+- Note: a metadata- or pixel-changed file does **not** reach this step — it has a new hash
+  and is handled as `DELETE` + `UPLOAD` (§4). Only byte-identical files with differing
+  records are compared here.
 - After steps 5.1–5.3, the two "remaining" sets (hashes present on both sides) are equal in
   size; the current assertion `len(remaining_local) == len(remaining_remote)` is correct and
   must be kept.
@@ -227,7 +233,7 @@ The client validates `local_pairs` **before** running the algorithm. A validatio
 is a **general error** reported to the user and **aborts the sync** — "before any
 synchronization is even started". Nothing is applied.
 
-- **No duplicate content / no photo in two events.** A single pixel hash MUST map to
+- **No duplicate content / no photo in two events.** A single content hash MUST map to
   **exactly one** record. If two local files produce the same hash but **different**
   records (in particular different events), this is a **FATAL** error; no duplicates are
   tolerated and the sync does not start.
@@ -241,7 +247,8 @@ synchronization is even started". Nothing is applied.
   decision (§3.3).
 - **Same-name albums** → multiple, disambiguated by identity (`year/month`); server tracks
   identity→id (§3.1).
-- **Metadata-only change** (incl. day/time within the same month) → always `MOVE` (§4).
+- **Metadata-only change** (incl. day/time within the same month) → the file bytes change
+  → `DELETE`(old hash) + `UPLOAD`(new hash); **not** a MOVE (§4).
 - **Pixel-only change, same position** → `DELETE`(old hash) + `UPLOAD`(new hash); **not** a
   move.
 - **Server photo with no event metadata but its hash is local** → `MOVE` (it gets assigned

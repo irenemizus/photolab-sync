@@ -2,13 +2,13 @@
 
 The SyncClient is the brain: it scans the local 7-level tree, prepares each
 image's final file (pixels + augmented metadata, docs/design-metadata.md),
-computes the pixel SHA512, validates the local set, builds the ordered list of
-atomic operations (docs/design-algorithm.md), and drives the session against
-the SyncServer REST API (docs/design-api.md):
+computes the content SHA512 (over the raw file bytes), validates the local set,
+builds the ordered list of atomic operations (docs/design-algorithm.md), and
+drives the session against the SyncServer REST API (docs/design-api.md):
 
-    start-sync -> collect -> poll collect/status -> apply ops in order -> stop-sync
+    sync/start -> collect -> poll collect/status -> apply ops in order -> sync/stop
 
-The final file (the upload payload) is kept in memory, keyed by pixel hash.
+The final file (the upload payload) is kept in memory, keyed by content hash.
 A crashed sync is resumed by re-running it: operations are idempotent and a
 fresh collect re-converges (docs/design-algorithm.md §6.2). A mid-sync
 "already_deleted" is non-fatal and triggers a full re-run (docs/design-api.md
@@ -39,7 +39,7 @@ from algorithm_builder import (
 )
 from metadata import Metadata
 from place import Place
-from pixel_hash import compute_pixel_hash
+from content_hash import compute_content_hash
 from record import Record, format_identity
 
 log = logging.getLogger("photolab-sync.client")
@@ -87,8 +87,8 @@ class SyncApiClient:
     """Thin client for the SyncServer REST API (docs/design-api.md).
 
     Plain HTTP, no security beyond the opaque one-time session key, which is
-    returned by start-sync and sent as `Authorization: <key>` on every other
-    call. Long work (collect) is "start (102)" + "poll status"; no single
+    returned by sync/start and sent as `Authorization: <key>` on every other
+    call. Long work (collect) is "start (202)" + "poll status"; no single
     request blocks for long.
     """
 
@@ -108,15 +108,15 @@ class SyncApiClient:
     # -- session ---------------------------------------------------------
 
     def start_sync(self) -> str:
-        """POST /v1/start-sync — begin a session, returns the one-time key (§6.1)."""
-        data = self._request("POST", "/v1/start-sync", auth=False).json()
+        """POST /v1/sync/start — begin a session, returns the one-time key (§6.1)."""
+        data = self._request("POST", "/v1/sync/start", auth=False).json()
         self._key = data["key"]
         log.info("sync session started (key ttl %ss)", data.get("key_ttl_seconds"))
         return self._key
 
     def stop_sync(self) -> None:
-        """POST /v1/stop-sync — invalidate the key, release the session (§6.4)."""
-        self._request("POST", "/v1/stop-sync", body={})
+        """POST /v1/sync/stop — invalidate the key, release the session (§6.4)."""
+        self._request("POST", "/v1/sync/stop", body={})
         self._key = None
         log.info("sync session stopped")
 
@@ -125,21 +125,19 @@ class SyncApiClient:
     def collect(self) -> None:
         """POST /v1/collect — start the collection job (§6.2).
 
-        The spec's 102 body carries a job id, but 1xx responses carry no body
-        (RFC 9110 §9.2) so it is not transmitted. The client does not need it:
-        collect/status polls the session's single in-flight collection.
+        The 202 response carries the job id + progress; the client does not need
+        them here — collect/status polls the session's single in-flight
+        collection.
         """
         self._request("POST", "/v1/collect", body={})
 
     def collect_status(self) -> dict:
         """GET /v1/collect/status — poll the in-flight collection (§6.2).
 
-        102 = running (1xx, no body), 200 = done (body has result + extra_copies).
+        202 = running (body has progress), 200 = done (body has result +
+        extra_copies). Both carry a JSON body, so it is returned as-is.
         """
-        resp = self._request("GET", "/v1/collect/status")
-        if resp.status_code == 102:
-            return {"status": "running"}
-        return resp.json()
+        return self._request("GET", "/v1/collect/status").json()
 
     # -- atomic operations (applied in client-given order, §6.3) ----------
 
@@ -155,7 +153,7 @@ class SyncApiClient:
 
     def delete(self, h: str | None, asset_id: str | None) -> None:
         # asset_id targets one of several duplicate copies (§6.3); otherwise
-        # the photo is addressed by its pixel hash.
+        # the photo is addressed by its content hash.
         body = {"asset_id": asset_id} if asset_id else {"hash": h}
         self._request("POST", "/v1/delete", body=body)
 
@@ -170,14 +168,14 @@ class SyncApiClient:
         self._request("POST", "/v1/move", body=body)
 
     def create_album(self, identity: tuple, name: str) -> None:
-        self._request("POST", "/v1/create-album",
+        self._request("POST", "/v1/album/create",
                       body={"identity": format_identity(identity), "name": name})
 
     def delete_album(self, identity: tuple) -> None:
-        self._request("POST", "/v1/delete-album", body={"identity": format_identity(identity)})
+        self._request("POST", "/v1/album/delete", body={"identity": format_identity(identity)})
 
     def rename_album(self, identity: tuple, new_name: str) -> None:
-        self._request("POST", "/v1/rename-album",
+        self._request("POST", "/v1/album/rename",
                       body={"identity": format_identity(identity), "new_name": new_name})
 
     # -- transport --------------------------------------------------------
@@ -251,8 +249,8 @@ class SyncClient:
         self._poll_interval = poll_interval
         self._collect_timeout = collect_timeout
         self._max_sync_restarts = max_sync_restarts
-        self._files: dict[str, bytes] = {}      # pixel hash -> final file bytes
-        self._extensions: dict[str, str] = {}   # pixel hash -> file extension
+        self._files: dict[str, bytes] = {}      # content hash -> final file bytes
+        self._extensions: dict[str, str] = {}   # content hash -> file extension
 
     # -- entry point ------------------------------------------------------
 
@@ -296,7 +294,7 @@ class SyncClient:
             try:
                 self.api.stop_sync()
             except SyncError as exc:
-                log.warning("stop-sync failed (session may have expired): %s", exc)
+                log.warning("sync/stop failed (session may have expired): %s", exc)
         return SyncResult(operations=operations, counts=counts,
                           remote_photos=len(remote_pairs))
 
@@ -313,7 +311,8 @@ class SyncClient:
                 if time.monotonic() > deadline:
                     raise SyncError(
                         f"collection did not finish within {self._collect_timeout:.0f}s")
-                log.info("collection in progress")
+                log.info("collection in progress: %d%%",
+                         round(100 * float(data.get("progress", 0.0))))
                 time.sleep(self._poll_interval)
                 continue
             raise SyncError(f"unexpected collection status: {status!r}")
@@ -324,8 +323,8 @@ class SyncClient:
         """Walk the tree, run the upload-preparation pipeline on every
         supported image (design-metadata.md), and validate the local set.
 
-        Returns {pixel_hash: Record}; the final files are kept in memory,
-        keyed by pixel hash, ready to be sent as upload/move payloads.
+        Returns {content_hash: Record}; the final files are kept in memory,
+        keyed by content hash, ready to be sent as upload/move payloads.
         """
         self._files.clear()
         self._extensions.clear()
@@ -342,7 +341,7 @@ class SyncClient:
                 md.date_time_original = _date_time_for(md.date_time_original, place)
                 tmp = self._write_final_file(path, md)
                 temps.append(tmp)
-                h = compute_pixel_hash(tmp.read_bytes())
+                h = compute_content_hash(tmp.read_bytes())
                 rec = Record(
                     year=place.year,
                     month=place.month,

@@ -17,5 +17,5 @@ requires = ["setuptools>=61"]
 build-backend = "build_backend"
 
 [tool.setuptools]
-py-modules = ["metadata", "place", "record", "pixel_hash",
-              "algorithm_builder", "sync_client", "stub_sync_server"]
+  py-modules = ["metadata", "place", "record", "content_hash",
+                "algorithm_builder", "sync_client", "stub_sync_server"]

@@ -6,7 +6,7 @@ For every local image the client does:
     md    = Metadata.from_file(path)           # read whatever the file already has
     md.patch_from_place(place)                 # fill missing fields from the path
     md.write_to_file(...)                       # produce the FINAL file (kept in memory)
-The final file's pixels are uploaded to the SyncServer and SHA512-hashed (pixels only);
+The final file is uploaded to the SyncServer and SHA512-hashed over its raw bytes;
 its metadata is what Immich indexes and displays. The 7-level layout never reaches the
 server -- it is flattened into these tags before upload.
 
