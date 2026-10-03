@@ -14,7 +14,7 @@ from PIL import Image
 
 from content_hash import compute_content_hash
 
-DATA_DIR = Path(__file__).parent / "pyexiv2" / "data"
+DATA_DIR = Path(__file__).parent / "data"
 
 
 def _bytes(image: Image.Image, fmt: str, **save_kwargs) -> bytes:
