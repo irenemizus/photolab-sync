@@ -98,8 +98,9 @@ Codes (non-exhaustive):
 
 ### 6.2 `POST /v1/collect` and `GET /v1/collect/status`
 - **`POST /v1/collect`** (auth: key). Ask the server to (re)compute the remote set: list
-  **every** asset from Immich, download each via `GET /assets/{id}` one by one, compute the
-  content SHA512 over the raw file bytes, and reconstruct the **record** from its metadata.
+   **every** asset from Immich, download each via `GET /assets/{id}` one by one, compute the
+   content SHA512 over the **pixel bit-stream** (metadata stripped, `design-metadata.md`),
+   and reconstruct the **record** from its metadata.
   - **Concurrency:** **only one** collection may run at a time. If one is already running,
     respond `409 collection_in_progress`.
   - **Response:** `202`
@@ -171,15 +172,13 @@ Each returns `200` with a small result on success, or a JSON error otherwise.
     {
       "hash": "<sha512>",
       "album": "<target 4-level identity>",
-      "record": { "…target full record…": "" },
-      "refreshed_file": "<optional bytes>"
+      "record": { "…target full record…": "" }
     }
     ```
-  - **Server:** move the asset into the target album and **rewrite** its metadata to the
-    target record. A MOVE always rewrites metadata, even if the album is unchanged
-    (`design-algorithm.md §4`). When only metadata changed (same album/path), the payload
-    carries `refreshed_file` (the final file with the updated metadata) so the server can
-    update the asset's stored metadata.
+  - **Server:** the pixel bit-stream is unchanged (same hash); the server updates the
+    asset's stored **metadata** in Immich to the target record and moves the asset into
+    the target album. No file re-upload is needed: the server fetches the asset from
+    Immich, rewrites its metadata, and saves it back (`design-algorithm.md §4`).
 
 - **`POST /v1/album/create`**
   - **Body:** `{ "identity": "<4-level>", "name": "<event> — <subevent>" }`.

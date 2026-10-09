@@ -2,7 +2,7 @@
 
 The SyncClient is the brain: it scans the local 7-level tree, prepares each
 image's final file (pixels + augmented metadata, docs/design-metadata.md),
-computes the content SHA512 (over the raw file bytes), validates the local set,
+computes the content SHA512 (over the pixel bit-stream, metadata stripped),
 builds the ordered list of atomic operations (docs/design-algorithm.md), and
 drives the session against the SyncServer REST API (docs/design-api.md):
 
@@ -157,14 +157,12 @@ class SyncApiClient:
         body = {"asset_id": asset_id} if asset_id else {"hash": h}
         self._request("POST", "/v1/delete", body=body)
 
-    def move(self, h: str, record: Record, refreshed_file: bytes | None) -> None:
+    def move(self, h: str, record: Record) -> None:
         body = {
             "hash": h,
             "album": format_identity(record.album_identity),
             "record": record.to_dict(),
         }
-        if refreshed_file is not None:
-            body["refreshed_file"] = base64.b64encode(refreshed_file).decode("ascii")
         self._request("POST", "/v1/move", body=body)
 
     def create_album(self, identity: tuple, name: str) -> None:
@@ -418,10 +416,7 @@ class SyncClient:
         elif t is OperationType.DELETE:
             self.api.delete(op.hash, op.asset_id)
         elif t is OperationType.MOVE:
-            refreshed = None
-            if op.from_record.album_identity == op.record.album_identity:
-                refreshed = self._files[op.hash]
-            self.api.move(op.hash, op.record, refreshed)
+            self.api.move(op.hash, op.record)
         elif t is OperationType.CREATE_ALBUM:
             self.api.create_album(op.album, op.album_name)
         elif t is OperationType.DELETE_ALBUM:

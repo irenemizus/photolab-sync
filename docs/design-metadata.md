@@ -81,48 +81,54 @@ The final file has:
 - **pixels** identical to the original (metadata patching never alters pixel data);
 - **metadata** complete enough for Immich to index and display (rating, category, event, …).
 
-That final file is the **upload payload**, and its **raw bytes** are the **hash source**
-(below).
+That final file is the **upload payload**. Its **pixel bit-stream** (encoded pixels,
+metadata stripped) is the **hash source** (below).
 
 ## Content hashing (image identity)
-- An image's identity is the **SHA512 of its raw file bytes**.
-- The digest is computed over the file **exactly as stored**: pixels, container/encoding
-  bytes, and **all metadata are part of the identity**. No decoding, no normalisation. Two
-  files that differ in **any** byte — pixels, encoding, or metadata — hash to a **different**
-  value.
-- This hash is the **join key** between the local set and the remote set in the sync
-  algorithm (`design-algorithm.md`).
-- **Consequence:** any change to the file (pixels **or** metadata **or** encoding — e.g.
-  re-rating, re-encoding, or moving to a folder that rewrites tags) changes the hash. The old
-  identity therefore **disappears** (`DELETE`) and the new one **appears** (`UPLOAD`); a
-  file-level change is a delete+upload, **not** a `MOVE`. A `MOVE` is emitted only when the
-  **same** file bytes map to **different** records (see `design-algorithm.md` §4).
-- The **server** computes the same hash on collect by downloading the full asset bytes via
-  `GET /assets/{id}` and hashing them — no decoding (see `design-api.md`).
-- No pixel-buffer normalisation is needed: the digest is over the literal file bytes, so
-  client and server agree as long as Immich stores and returns the uploaded original
-  unchanged (the invariant below). Multi-frame / preview bytes are part of the file and are
-  included automatically.
+- An image's identity is the **SHA512 of its pixel bit-stream**: the encoded pixel
+  data with all metadata segments, chunks, or tags stripped. No decoding, no
+  normalisation. Two files with identical pixels and encoding hash to the **same**
+  value regardless of their metadata.
+- **JPEG:** all APPn (0xE0–0xEF) and COM (0xFE) segments are stripped; the
+  remaining SOI, DQT, DRI, SOFn, DHT, SOS, scan data, and EOI form the hash source.
+- **PNG:** all ancillary chunks are stripped; the Signature, IHDR, PLTE, tRNS,
+  IDAT, and IEND chunks form the hash source.
+- **TIFF:** the strip/tile image data (referenced by StripOffsets/TileOffsets in
+  the first IFD) is the hash source; all IFD tags (metadata) are excluded.
+- A change to the **pixels** (or the **encoding**, e.g. JPEG↔PNG) changes the
+  hash; a change to **metadata alone** does **not**.
+- This hash is the **join key** between the local set and the remote set in the
+  sync algorithm (`design-algorithm.md`).
+- **Consequence:** a pixel change (re-photograph, edit, re-encode) yields a
+  `DELETE`(old hash) + `UPLOAD`(new hash). A **metadata-only** change (re-rating,
+  re-filing, a day/time change) keeps the same hash → a `MOVE` (the server
+  updates the asset's stored metadata in Immich; no file re-upload). See
+  `design-algorithm.md` §4.
+- The **server** computes the same hash on collect by downloading the full asset
+  bytes via `GET /assets/{id}` and stripping metadata the same way — no decoding
+  (see `design-api.md`).
 
 ### Invariants (client and server must both hold)
-- **Stored-bytes immutability:** `client_hash == server_hash` holds only if the bytes Immich
-  stores and returns via `GET /assets/{id}` are **byte-for-byte identical** to the client's
-  final file. This is true only if Immich stores the uploaded **original** without
-  re-encoding / re-serialisation and we always fetch the **original** (not a
-  preview/thumbnail). If Immich ever re-encodes or re-saves the original, every photo would
-  look "new + deleted" each sync. **Verify against the target Immich version before relying
-  on it.**
-- **Deterministic (idempotent) metadata write:** the upload-preparation write must be
-  idempotent — preparing the same file twice yields **byte-identical** output — so the local
-  hash is stable across runs and re-syncs. (The client hashes the prepared file and uploads
-  that same file, so the local and upload hashes match by construction; the stored-bytes
-  invariant above is what makes the *remote* hash match on the next collect.)
+- **Stored-bytes immutability:** `client_hash == server_hash` holds only if the
+  bytes Immich stores and returns via `GET /assets/{id}` carry the **same pixel
+  bit-stream** as the client's final file. Since the hash strips metadata, a
+  metadata-only difference between the stored and local file does **not** break
+  the hash — only a pixel or encoding difference does. This holds only if Immich
+  stores the uploaded **original** without re-encoding and we always fetch the
+  **original** (not a preview/thumbnail). **Verify against the target Immich
+  version before relying on it.**
+- **Deterministic (idempotent) metadata write:** the upload-preparation write
+  must be idempotent — preparing the same file twice yields **byte-identical**
+  output. The metadata write is lossless w.r.t. pixels, so the pixel bit-stream
+  of the prepared file equals that of the original, and the hash is stable across
+  runs.
 
 ## Supported formats
 - **Supported:** jpeg, tiff, png.
 - **Not supported:** RAW and any other format, unless the metadata write path is cheap and
-  already supported by the current tooling. (Content hashing needs no decoding, so format
-  support is gated only by metadata write-back.)
+  already supported by the current tooling. (Content hashing strips metadata from the
+  encoded bit-stream — no decoding — so format support is gated only by metadata
+  write-back.)
 - `TODO`: fix the accepted-extension list in the client (the test file currently lists many
   extensions, e.g. RAW, which are out of scope) to exactly the supported set.
 

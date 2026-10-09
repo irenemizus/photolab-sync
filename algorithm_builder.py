@@ -13,12 +13,11 @@ Inputs (design-algorithm.md §1.1):
     local_pairs:  { content_sha512_hex : Record }
     remote_pairs: { content_sha512_hex : Record }
 
-The key is the photo's content hash (SHA512 over the raw file bytes — pixels,
-container, and metadata are ALL part of the hash). The value is the full
-**Record** (design-algorithm.md §1.2): place + full date_time_original. A file
-change (pixels, metadata, or encoding) yields a new hash, so it is a
-DELETE(old) + UPLOAD(new) — a MOVE fires only when byte-identical files carry
-different records (§4).
+The key is the photo's content hash (SHA512 over the **pixel bit-stream** —
+encoded pixels, metadata stripped). The value is the full **Record**
+(design-algorithm.md §1.2): place + full date_time_original. A pixel or encoding
+change yields a new hash (DELETE(old) + UPLOAD(new)); a metadata-only change
+keeps the same hash and is a MOVE (§4).
 
 `extra_copies` (design-api.md §6.2 "duplicate encoding") lists the additional
 server-side assets sharing a hash: [{"asset_id": ..., "hash": ...}]; each gets
@@ -73,11 +72,10 @@ class Operation:
         DELETE_ALBUM  album
         RENAME_ALBUM  album (current identity), album_name (new display name)
 
-    A MOVE is emitted when byte-identical files (same content hash) carry
-    different records (§4). A file change (pixels, metadata, or encoding) yields
-    a new hash and is a DELETE(old) + UPLOAD(new), not a MOVE. The MOVE payload
-    carries the refreshed file bytes (the client's final file) so the server can
-    update the asset's stored metadata.
+    A MOVE is emitted when the pixel bit-stream is unchanged (same content hash)
+    but the records differ (§4). A pixel or encoding change yields a new hash
+    and is a DELETE(old) + UPLOAD(new), not a MOVE. The server updates the
+    asset's stored metadata in Immich (no file re-upload).
     """
 
     operation_type: OperationType
@@ -166,7 +164,7 @@ def build_sync_algorithm(
         for h in sorted(set(local_pairs) - set(remote_pairs))
     ]
 
-    # --- §5.3 moved / metadata-changed -> MOVE ---
+    # --- §5.3 same pixel bit-stream, differing record -> MOVE ---
     common = set(local_pairs) & set(remote_pairs)
     moves = [
         Operation(OperationType.MOVE, hash=h, from_record=remote_pairs[h], record=local_pairs[h])

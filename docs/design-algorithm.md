@@ -23,8 +23,8 @@ local_pairs:  { content_sha512_hex : record }
 remote_pairs: { content_sha512_hex : record }
 ```
 
-- **Key** = the photo's **content hash**: SHA512 over the **raw file bytes** (pixels,
-  container, and metadata are **all** part of the hash; see `design-metadata.md`).
+- **Key** = the photo's **content hash**: SHA512 over the **pixel bit-stream**
+  (encoded pixels, metadata stripped; see `design-metadata.md`).
 - **Value** = a **record** describing where the photo lives and its managed metadata
   (§1.2). The current code uses a *path string* as the value; that is a simplification
   (§1.3).
@@ -142,23 +142,25 @@ specified.
     merge rule + anchor rule. Until decided, **Case A is the safe default.**
 
 ## 4. MOVE semantics
-A **MOVE** is emitted for a content hash (i.e. **identical file bytes**) present on
+A **MOVE** is emitted for a content hash (i.e. **identical pixel bit-stream**) present on
 **both** sides when the two **records** differ in any field (§1.2):
 `MOVE(hash, from=remote_record, to=local_record)`.
 
-Because the content hash is over the **whole file** (`design-metadata.md`), a change to the
-file — pixels **or** metadata **or** encoding — yields a **new** hash. Such a change is a
-`DELETE` (old hash, §5.2) + `UPLOAD` (new hash, §5.1), **not** a MOVE. In particular:
+Because the content hash is over the **pixel bit-stream** (metadata stripped,
+`design-metadata.md`), a change to the **pixels** or the **encoding** (e.g. JPEG↔PNG)
+yields a **new** hash. Such a change is a `DELETE` (old hash, §5.2) + `UPLOAD` (new hash,
+§5.1), **not** a MOVE. In particular:
 
-- **Metadata-only change** (re-rating, re-encoding, a day/time change within the same
-  month, re-filing into a folder that rewrites tags): the file bytes change ⇒ the hash
-  changes ⇒ `DELETE` + `UPLOAD`.
-- **Pixel-only change** (re-photograph / edit, same position): same ⇒ `DELETE` + `UPLOAD`.
+- **Pixel change** (re-photograph, edit, re-encode to a different format): new hash
+  ⇒ `DELETE` + `UPLOAD`.
+- **Metadata-only change** (re-rating, re-filing into a folder that rewrites tags, a
+  day/time change within the same month): the pixel bit-stream is unchanged ⇒ the hash
+  is unchanged ⇒ `MOVE` (the server updates the asset's stored metadata in Immich;
+  no file re-upload).
 
-A MOVE therefore only fires when **byte-identical** files carry **different** records — a
-narrow case (e.g. the remote record reconstructed from embedded metadata diverges from the
-local record for the very same file). When a MOVE does fire, it must still update the asset's
-stored metadata on the server; the payload carries the refreshed file
+A MOVE therefore fires whenever **identical pixels** carry **different** records. The
+server is responsible for applying the metadata update: it fetches the asset from
+Immich, rewrites its metadata to the target record, and saves it back
 (`design-api.md §6.3`).
 
 ## 5. Reconciling content (the phases)
@@ -188,9 +190,9 @@ reporting.
 - For each `h in set(L.keys()) & set(R.keys())`:
   - if `L[h] != R[h]` (records differ, §4): emit `MOVE(h, from=R[h], to=L[h])`.
   - else: no operation (already consistent).
-- Note: a metadata- or pixel-changed file does **not** reach this step — it has a new hash
-  and is handled as `DELETE` + `UPLOAD` (§4). Only byte-identical files with differing
-  records are compared here.
+- Note: a pixel-changed file does **not** reach this step — it has a new hash
+  and is handled as `DELETE` + `UPLOAD` (§4). A **metadata-only** change keeps the
+  same hash and **does** reach this step, producing a MOVE.
 - After steps 5.1–5.3, the two "remaining" sets (hashes present on both sides) are equal in
   size; the current assertion `len(remaining_local) == len(remaining_remote)` is correct and
   must be kept.
@@ -247,8 +249,8 @@ synchronization is even started". Nothing is applied.
   decision (§3.3).
 - **Same-name albums** → multiple, disambiguated by identity (`year/month`); server tracks
   identity→id (§3.1).
-- **Metadata-only change** (incl. day/time within the same month) → the file bytes change
-  → `DELETE`(old hash) + `UPLOAD`(new hash); **not** a MOVE (§4).
+- **Metadata-only change** (incl. day/time within the same month, re-rating, re-filing)
+  → pixel bit-stream unchanged → same hash → `MOVE` (server updates metadata, §4).
 - **Pixel-only change, same position** → `DELETE`(old hash) + `UPLOAD`(new hash); **not** a
   move.
 - **Server photo with no event metadata but its hash is local** → `MOVE` (it gets assigned

@@ -28,7 +28,7 @@ rely on its internal implementation details.
 ### Block responsibilities
 #### SyncClient (the "smart" side)
 - Scans the local tree, prepares each image's final metadata (see `design-metadata.md`),
-  and computes a content hash (SHA512 over the **raw file bytes**).
+  and computes a content hash (SHA512 over the **pixel bit-stream**, metadata stripped).
 - Validates the local set (no duplicate content across events — a fatal pre-check).
 - Builds the **ordered** list of atomic operations that reconciles local state with remote
   state (see `design-algorithm.md`).
@@ -37,8 +37,9 @@ rely on its internal implementation details.
 #### SyncServer (the "dumb translator")
 - Manages a single active sync session via a one-time key with a short inactivity TTL.
 - On collect: reads **every** asset from Immich, downloads its full bytes via
-  `GET /assets/{id}` one by one, and computes the **same content SHA512** over the raw
-  file bytes; reconstructs each asset's 7-level position from its embedded metadata;
+  `GET /assets/{id}` one by one, and computes the **same content SHA512** over the
+  **pixel bit-stream** (metadata stripped); reconstructs each asset's 7-level position
+  from its embedded metadata;
   returns `{hash → position}` pairs. **No caching** — the full set is re-downloaded and
   re-hashed on every sync.
 - Translates each client atomic operation into the corresponding Immich API call, applying
@@ -55,9 +56,10 @@ rely on its internal implementation details.
 
 ## Key design decisions
 - **Immich is a black box.** We use its public API only; nothing depends on internals.
-- **Content identity = SHA512 of the raw file bytes** (pixels, container, and metadata are
-  all part of the identity). Full bytes are re-downloaded and re-hashed on every sync.
-  **No caching** anywhere (for now).
+- **Content identity = SHA512 of the pixel bit-stream** (encoded pixels, metadata
+  stripped). A metadata-only change does **not** change the identity (→ MOVE); a pixel
+  or encoding change does (→ DELETE + UPLOAD). Full bytes are re-downloaded and
+  re-hashed on every sync. **No caching** anywhere (for now).
 - **Metadata is flattened into the file.** The 7-level layout exists *only* on the client;
   before upload the place is merged into the image's metadata (see `design-metadata.md`).
   Immich only ever sees "pixels + metadata", never the original file path.
@@ -78,9 +80,9 @@ rely on its internal implementation details.
 
 ## Supported formats
 jpeg, tiff, png. No RAW. Additional formats are added only if the metadata write path is
-cheap and the metadata tooling already supports them. (Content hashing needs no decoding —
-it is SHA512 over the raw file bytes — so format support is gated only by metadata
-write-back.)
+  cheap and the metadata tooling already supports them. (Content hashing strips metadata
+  from the encoded bit-stream — no decoding — so format support is gated only by metadata
+  write-back.)
 
 ## Detailed documents
 - `design-metadata.md` — the Place/Metadata model, the per-image upload preparation

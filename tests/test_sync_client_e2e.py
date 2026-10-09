@@ -50,8 +50,8 @@ def _tree(root: Path) -> dict[str, str]:
 def test_full_sync_against_empty_stub(tmp_path):
     root = tmp_path / "photos"
     rel = _tree(root)
-    # Content hashing changes the file bytes (metadata is written back), so
-    # "pixels intact" is checked by comparing decoded RGB, not file hashes.
+    # The metadata write changes the file bytes (but not the pixel bit-stream),
+    # so "pixels intact" is checked by comparing decoded RGB, not file hashes.
     pixels_before = {name: Image.open(root / relpath).convert("RGB").tobytes()
                      for name, relpath in rel.items()}
 

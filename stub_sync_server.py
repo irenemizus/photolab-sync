@@ -276,14 +276,14 @@ def _ep_delete(handler, state: _ServerState, body) -> tuple[int, dict]:
 
 
 def _ep_move(handler, state: _ServerState, body) -> tuple[int, dict]:
-    """POST /v1/move — pretend to move + rewrite metadata (§6.3)."""
+    """POST /v1/move — pretend to update the asset's metadata (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "hash" not in body:
         raise _ApiError(400, "bad_request", "move body must carry a hash")
-    refreshed = body.get("refreshed_file")
     return 200, {"ok": True, "moved": body["hash"],
-                 "refreshed": refreshed is not None}
+                 "album": body.get("album"),
+                 "record": body.get("record")}
 
 
 def _ep_create_album(handler, state: _ServerState, body) -> tuple[int, dict]:

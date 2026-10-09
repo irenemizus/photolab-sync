@@ -79,7 +79,7 @@ def test_delete_for_removed_content():
 
 
 def test_pixel_change_is_delete_plus_upload_not_move():
-    # different pixels => different hash: old one gone, new one added (§4)
+    # different pixel bit-stream => different hash: old one gone, new one added (§4)
     local = {"h2": rec(2026, 4, "A", "B")}
     remote = {"h1": rec(2026, 4, "A", "B")}
     ops = build_sync_algorithm(local, remote)
@@ -87,8 +87,7 @@ def test_pixel_change_is_delete_plus_upload_not_move():
 
 
 def test_metadata_only_change_is_move():
-    # same pixels (same hash), rating changed -> MOVE even though the
-    # 7-level path projection would look identical (§4)
+    # same pixel bit-stream (same hash), rating changed -> MOVE (§4)
     r_local = rec(2026, 4, "A", "B", rating=5)
     r_remote = rec(2026, 4, "A", "B", rating=3)
     ops = build_sync_algorithm({"h": r_local}, {"h": r_remote})

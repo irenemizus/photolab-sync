@@ -163,16 +163,17 @@ def test_upload_payload_is_recorded(server, session):
     assert up["file_size"] == 5
 
 
-def test_move_reports_refreshed_flag(server, session):
+def test_move_returns_album_and_record(server, session):
     key = start(server, session)
     headers = {"Authorization": key}
+    rec = {"year": 2026, "month": 4, "event": "A", "subevent": "B"}
     r = session.post(server.url + "/v1/move", headers=headers,
-                     json={"hash": "h1", "album": "2026/4/A/B", "record": {}})
-    assert r.json()["refreshed"] is False
-    r = session.post(server.url + "/v1/move", headers=headers,
-                     json={"hash": "h1", "album": "2026/4/A/B", "record": {},
-                           "refreshed_file": "aGk="})
-    assert r.json()["refreshed"] is True
+                     json={"hash": "h1", "album": "2026/4/A/B", "record": rec})
+    data = r.json()
+    assert data["ok"] is True
+    assert data["moved"] == "h1"
+    assert data["album"] == "2026/4/A/B"
+    assert data["record"] == rec
 
 
 # -- logging ----------------------------------------------------------------------------

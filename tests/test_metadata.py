@@ -20,7 +20,7 @@ import pytest
 from metadata import Metadata
 from place import Place
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent / "data"
 
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".gif", ".bmp",
