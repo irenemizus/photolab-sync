@@ -131,7 +131,7 @@ def _tiff_pixel_bytes(data: bytes) -> bytes:
         if off + 12 > n:
             break
         tag = struct.unpack(endian + "H", data[off:off + 2])[0]
-        if tag not in (273, 278, 324, 325):  # StripOffsets, StripByteCounts, TileOffsets, TileByteCounts
+        if tag not in (273, 279, 324, 325):  # StripOffsets, StripByteCounts, TileOffsets, TileByteCounts
             continue
         typ = struct.unpack(endian + "H", data[off + 2:off + 4])[0]
         count = struct.unpack(endian + "I", data[off + 4:off + 8])[0]
