@@ -1,6 +1,7 @@
 """PEP 517 backend that builds the vendored pyexiv2, then delegates to setuptools.
 
-Install with build isolation disabled so pyexiv2 lands in the active venv:
+Works with or without build isolation:
+    pip install -e .
     pip install -e . --no-build-isolation
 """
 
@@ -33,7 +34,8 @@ def get_requires_for_build_wheel(config_settings=None):
 
 
 def get_requires_for_build_editable(config_settings=None):
-    return ["setuptools>=61"]
+    # >=64: first version with prepare_metadata_for_build_editable
+    return ["setuptools>=64"]
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
@@ -41,6 +43,14 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     import setuptools.build_meta as meta
 
     return meta.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+
+
+def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
+    # Metadata only; the native build happens in build_editable.
+    _ensure_setuptools()
+    import setuptools.build_meta as meta
+
+    return meta.prepare_metadata_for_build_editable(metadata_directory, config_settings)
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):

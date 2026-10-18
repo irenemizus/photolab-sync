@@ -46,6 +46,29 @@ def original_python() -> str:
     return sys.executable
 
 
+def target_env() -> dict[str, str]:
+    # When pip runs us with build isolation it sets PYTHONPATH to a temp
+    # dir whose sitecustomize.py strips the venv's own site-packages from
+    # every spawned python (it mistakes them for "system" site packages,
+    # since site.getsitepackages() returns the venv's dir inside a venv).
+    # Drop those vars so the target venv's python sees its packages.
+    return {k: v for k, v in os.environ.items()
+            if k not in ("PYTHONPATH", "PYTHONNOUSERSITE")}
+
+
+def ensure_target_setuptools() -> None:
+    # pyexiv2 is a legacy setup.py project; pip probes its
+    # setuptools.build_meta backend in the current environment, so the
+    # target venv must have setuptools.
+    probe = subprocess.run(
+        [TARGET_PY, "-c", "import setuptools"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=target_env())
+    if probe.returncode != 0:
+        print("=== installing: setuptools (into target venv) ===")
+        subprocess.run([TARGET_PY, "-m", "pip", "install", "--quiet", "setuptools"],
+                       check=True, env=target_env())
+
+
 def build_venv_python() -> str:
     return str(BUILD_VENV / "bin" / "python")
 
@@ -221,12 +244,18 @@ def build_pyexiv2() -> None:
         shutil.copy2((PREFIX / "lib" / name).resolve(), PYEXIV2_LIB / name)
 
     print("=== installing: pyexiv2 ===")
-    subprocess.run([TARGET_PY, "-m", "pip", "install", "--quiet", str(PYEXIV2_SRC)], check=True)
+    ensure_target_setuptools()
+    # --no-build-isolation: setup.py only packages the prebuilt artifacts
+    # (ext_modules is empty), and nested isolation breaks the setuptools
+    # probe for legacy projects.
+    subprocess.run([TARGET_PY, "-m", "pip", "install", "--quiet",
+                    "--no-build-isolation", str(PYEXIV2_SRC)],
+                   check=True, env=target_env())
 
     print("=== sanity check: pyexiv2 ===")
     out = subprocess.run(
         [TARGET_PY, "-c", "import pyexiv2; print(pyexiv2.__exiv2_version__)"],
-        capture_output=True, text=True, check=True).stdout
+        capture_output=True, text=True, check=True, env=target_env()).stdout
     print(out.strip())
 
 
