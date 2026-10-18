@@ -94,7 +94,10 @@ class SyncApiClient:
 
     def __init__(self, base_url: str, *,
                  connect_timeout: float = 5.0,
-                 read_timeout: float = 600.0,
+                 # Must exceed the server's worst-case response time for a
+                 # large upload (its Immich upload budget + decode/write), or
+                 # the client aborts before the server can answer.
+                 read_timeout: float = 3600.0,
                  max_retries: int = 3,
                  retry_backoff: float = 1.0):
         self.base_url = base_url.rstrip("/")

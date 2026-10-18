@@ -22,6 +22,10 @@ import requests
 
 # (connect, read) — reads can stream a whole original file.
 DEFAULT_TIMEOUT = (5.0, 300.0)
+# A multi-GB asset: Immich's post-upload pipeline (transcode, metadata, face
+# scan) routinely exceeds the default read budget, so the upload gets its own,
+# much larger one.
+UPLOAD_TIMEOUT = (5.0, 3000.0)
 
 
 def _iso_utc(dt: datetime) -> str:
@@ -54,7 +58,14 @@ class ImmichClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
-        resp = self._http.request(method, f"{self.api_url}/{path.lstrip('/')}", **kwargs)
+        try:
+            resp = self._http.request(method, f"{self.api_url}/{path.lstrip('/')}", **kwargs)
+        except requests.exceptions.RequestException as exc:
+            # A timeout/reset while talking to Immich must surface as an
+            # ImmichError, not an unhandled requests exception that kills the
+            # calling handler thread and leaves the client hanging with no
+            # response at all.
+            raise ImmichError(0, f"transport error to Immich: {exc}") from exc
         if not resp.ok:
             try:
                 message = str(resp.json().get("message", resp.text))
@@ -120,7 +131,8 @@ class ImmichClient:
         }
         with open(file_path, "rb") as fh:
             files = {"assetData": (file_path.name, fh)}
-            resp = self._request("POST", "assets", params=params, data=data, files=files)
+            resp = self._request("POST", "assets", params=params, data=data, files=files,
+                                 timeout=UPLOAD_TIMEOUT)
         return resp.json()
 
     def delete_asset(self, asset_id: str) -> None:
