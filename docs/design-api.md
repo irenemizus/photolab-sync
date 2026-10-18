@@ -180,6 +180,24 @@ Each returns `200` with a small result on success, or a JSON error otherwise.
     the target album. No file re-upload is needed: the server fetches the asset from
     Immich, rewrites its metadata, and saves it back (`design-algorithm.md §4`).
 
+> **Immich byte-level dedup (v3, implementation note).** Immich deduplicates uploads
+> by the **whole file's bytes** — not by the pixel bit-stream — and an asset sitting
+> in the trash still blocks re-upload of a byte-identical file. The server therefore
+> relies on the `duplicate` upload response:
+> - **upload** of a byte-identical file returns the existing asset (alive or trashed);
+>   if it is trashed, the server **restores** it — the same file comes back to the
+>   timeline, which is exactly what the upload asked for.
+> - **move** rewrites the metadata, so the bytes change and the re-upload produces a
+>   fresh asset (the initial one is then deleted). If the rewritten bytes already
+ >   exist (e.g. a re-move to the same record), the server adopts the existing asset
+ >   (restoring it from the trash if needed) instead of creating a copy.
+
+> **Album membership is set explicitly (v3, implementation note).** Immich v3
+> **silently ignores** the `albumId` query parameter on the upload endpoint — an
+> uploaded asset lands in no album. The server therefore never relies on that
+> param: after every upload (the `created` and the `duplicate` path alike) it
+> calls `PUT /albums/{id}/assets` to attach the asset to the resolved album.
+
 - **`POST /v1/album/create`**
   - **Body:** `{ "identity": "<4-level>", "name": "<event> — <subevent>" }`.
 

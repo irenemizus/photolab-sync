@@ -18,4 +18,5 @@ build-backend = "build_backend"
 
 [tool.setuptools]
   py-modules = ["metadata", "place", "record", "content_hash",
-                "algorithm_builder", "sync_client", "stub_sync_server"]
+                "algorithm_builder", "sync_client", "stub_sync_server",
+                "immich_client", "sync_server"]
