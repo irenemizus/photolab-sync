@@ -52,8 +52,13 @@ def target_env() -> dict[str, str]:
     # every spawned python (it mistakes them for "system" site packages,
     # since site.getsitepackages() returns the venv's dir inside a venv).
     # Drop those vars so the target venv's python sees its packages.
+    # Also drop _PYPROJECT_HOOKS_*: pip leaks them into this process, and a
+    # stale _PYPROJECT_HOOKS_BACKEND_PATH makes a nested pip's in-process
+    # backend probe search the wrong directory for the backend module.
     return {k: v for k, v in os.environ.items()
-            if k not in ("PYTHONPATH", "PYTHONNOUSERSITE")}
+            if k not in ("PYTHONPATH", "PYTHONNOUSERSITE",
+                         "_PYPROJECT_HOOKS_BUILD_BACKEND",
+                         "_PYPROJECT_HOOKS_BACKEND_PATH")}
 
 
 def ensure_target_setuptools() -> None:
