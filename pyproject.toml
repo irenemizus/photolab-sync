@@ -15,6 +15,8 @@ dev = ["pytest>=8"]
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "build_backend"
+# The backend lives in the project root; point pip's PEP 517 machinery at it.
+backend-path = ["."]
 
 [tool.setuptools]
   py-modules = ["metadata", "place", "record", "content_hash",

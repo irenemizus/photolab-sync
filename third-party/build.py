@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Builds zlib, libexpat and exiv2 from the vendored sources in this directory.
+"""Builds zlib, libexpat and exiv2 from the vendored sources in this directory
+(on macOS and Linux).
 
-Everything is installed into third-party/prefix, using @rpath-based install
-names and relative rpaths so the whole tree is relocatable.
+Everything is installed into third-party/prefix, using @rpath (macOS) /
+$ORIGIN (Linux) install names so the whole tree is relocatable.
 
 Then compiles pyexiv2's C++ binding against that prefix and pip-installs
 pyexiv2 into the venv build.py was run from.
@@ -23,6 +24,7 @@ Environment overrides:
 """
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -32,6 +34,7 @@ from pathlib import Path
 TP = Path(__file__).resolve().parent
 PREFIX = TP / "prefix"
 BUILD_VENV = TP / "build" / ".venv"
+IS_MACOS = platform.system() == "Darwin"
 
 
 def original_python() -> str:
@@ -82,11 +85,16 @@ TARGET_PY: str
 
 PYEXIV2_SRC = TP / "pyexiv2"
 PYEXIV2_LIB = PYEXIV2_SRC / "pyexiv2" / "lib"
-# Our libexiv2's runtime dependencies, copied next to it so its @loader_path
-# rpath resolves them.
-PYEXIV2_RUNTIME_LIBS = ("libexiv2.dylib", "libexpat.1.dylib", "libz.1.dylib")
-# Artifacts staged into the pyexiv2 source tree (it is a submodule).
-PYEXIV2_ARTIFACTS = ("exiv2api.so",) + PYEXIV2_RUNTIME_LIBS
+# Our libexiv2's runtime dependencies, copied next to it so its relative rpath
+# (@loader_path on macOS, $ORIGIN on Linux) resolves them.
+if IS_MACOS:
+    PYEXIV2_RUNTIME_LIBS = ("libexiv2.dylib", "libexpat.1.dylib", "libz.1.dylib")
+else:
+    PYEXIV2_RUNTIME_LIBS = ("libexiv2.so", "libexpat.so.1", "libz.so.1")
+# Artifacts staged into the pyexiv2 source tree (it is a submodule); both
+# platform variants so clean works regardless of where the last build ran.
+PYEXIV2_ARTIFACTS = ("exiv2api.so", "libexiv2.dylib", "libexpat.1.dylib",
+                     "libz.1.dylib", "libexiv2.so", "libexpat.so.1", "libz.so.1")
 
 
 def clean() -> None:
@@ -107,6 +115,15 @@ def build(src: Path, builddir: Path, args: list[str]) -> None:
     subprocess.run([CMAKE, "-S", str(src), "-B", str(builddir)] + args, check=True)
     print(f"=== building: {builddir.name} ===")
     subprocess.run([CMAKE, "--build", str(builddir), f"-j{JOBS}"], check=True)
+
+
+# Install-name/rpath args that keep the prefix tree relocatable: @rpath-based
+# install names on macOS, an $ORIGIN rpath on Linux.
+if IS_MACOS:
+    INSTALL_NAME_ARGS = ['-DCMAKE_INSTALL_NAME_DIR="@rpath"', "-DCMAKE_INSTALL_RPATH="]
+else:
+    INSTALL_NAME_ARGS = ["-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
+                         "-DCMAKE_INSTALL_RPATH=$ORIGIN"]
 
 
 def strip_buggy_fixups(builddir: Path) -> None:
@@ -141,7 +158,8 @@ def strip_buggy_fixups(builddir: Path) -> None:
 
 def install(builddir: Path) -> None:
     print(f"=== installing: {builddir.name} ===")
-    strip_buggy_fixups(builddir)
+    if IS_MACOS:
+        strip_buggy_fixups(builddir)
     subprocess.run([CMAKE, "--install", str(builddir)], check=True)
 
 
@@ -176,21 +194,26 @@ def build_pyexiv2() -> None:
     # package that prebuilt artifact verbatim (it skips compilation when
     # exiv2api.so is already present). Unlike the upstream exiv2 release,
     # which links the system libexpat/libz, our libexiv2 references them via
-    # @rpath + its @loader_path rpath, so they must sit next to it as well.
-    # At import time pyexiv2/lib/__init__.py dlopens libexiv2.dylib from its
-    # own directory before importing exiv2api, whose (rpath-less) libexiv2
-    # dependency then resolves to that already-loaded image. pybind11's
-    # headers come from the build venv (same interpreter version as the
-    # target one, since the build venv is created from it).
+    # a relative install name (@rpath on macOS, $ORIGIN rpath on Linux), so
+    # they must sit next to it as well.
+    # At import time pyexiv2/lib/__init__.py dlopens the libexiv2 library
+    # from its own directory before importing exiv2api; the binding's
+    # libexiv2 load reference then resolves to that already-loaded image
+    # (by install name / soname). pybind11's headers come from the build
+    # venv (same interpreter version as the target one, since the build
+    # venv is created from it).
     pybind11_includes = subprocess.check_output(
         [build_venv_python(), "-m", "pybind11", "--includes"], text=True).split()
 
     print("=== building: pyexiv2 binding ===")
+    # macOS: -undefined dynamic_lookup keeps the binding free of a libexiv2
+    # load command; Linux links -lexiv2 normally, whose DT_NEEDED soname is
+    # satisfied by the image __init__.py dlopens first.
     subprocess.run(
         ["c++", "exiv2api.cpp", "-o", "exiv2api.so", "-O3", "-Wall", "-std=c++11",
          "-shared", "-fPIC"] + pybind11_includes +
-        ["-I", str(PREFIX / "include"), "-L", str(PREFIX / "lib"),
-         "-lexiv2", "-undefined", "dynamic_lookup"],
+        ["-I", str(PREFIX / "include"), "-L", str(PREFIX / "lib"), "-lexiv2"] +
+        (["-undefined", "dynamic_lookup"] if IS_MACOS else []),
         cwd=PYEXIV2_LIB, check=True)
 
     print("=== staging: exiv2 runtime libraries ===")
@@ -212,8 +235,7 @@ def main() -> None:
     TARGET_PY = original_python()
     ensure_build_venv()
     CMAKE = find_cmake()
-    JOBS = int(os.environ.get("JOBS") or subprocess.check_output(
-        ["sysctl", "-n", "hw.ncpu"]).strip().splitlines()[0])
+    JOBS = int(os.environ.get("JOBS") or os.cpu_count() or 1)
 
     # Fresh install tree on every run (build dirs are kept for incremental builds).
     if PREFIX.exists():
@@ -224,8 +246,7 @@ def main() -> None:
     build(TP / "zlib", TP / "zlib" / "build", [
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
-        '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
-        "-DCMAKE_INSTALL_RPATH=",
+        *INSTALL_NAME_ARGS,
         "-DZLIB_BUILD_SHARED=ON",
         "-DZLIB_BUILD_STATIC=OFF",
         "-DZLIB_BUILD_TESTING=OFF",
@@ -236,8 +257,7 @@ def main() -> None:
     build(TP / "libexpat" / "expat", TP / "libexpat" / "build", [
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
-        '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
-        "-DCMAKE_INSTALL_RPATH=",
+        *INSTALL_NAME_ARGS,
         "-DBUILD_SHARED_LIBS=ON",
         "-DEXPAT_BUILD_TESTS=OFF",
         "-DEXPAT_BUILD_TOOLS=OFF",
@@ -250,23 +270,29 @@ def main() -> None:
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_PREFIX_PATH={PREFIX}",
         f"-DCMAKE_INSTALL_PREFIX={PREFIX}",
-        '-DCMAKE_INSTALL_NAME_DIR="@rpath"',
-        "-DCMAKE_INSTALL_RPATH=",
+        *INSTALL_NAME_ARGS,
         "-DEXIV2_ENABLE_INIH=OFF",
         "-DEXIV2_ENABLE_BROTLI=OFF",
     ])
     install(TP / "exiv2" / "build")
 
-    # CMake bakes an absolute rpath into the CLI (for the build-tree libexiv2);
-    # replace it with a relative one so the tree stays relocatable.
-    normalize_rpaths(PREFIX / "bin" / "exiv2", "@loader_path/../lib")
-    # libexiv2 finds libz/libexpat in its own directory.
-    normalize_rpaths(PREFIX / "lib" / "libexiv2.dylib", "@loader_path")
+    if IS_MACOS:
+        # CMake bakes an absolute rpath into the CLI (for the build-tree
+        # libexiv2); replace it with a relative one so the tree stays
+        # relocatable.
+        normalize_rpaths(PREFIX / "bin" / "exiv2", "@loader_path/../lib")
+        # libexiv2 finds libz/libexpat in its own directory.
+        normalize_rpaths(PREFIX / "lib" / "libexiv2.dylib", "@loader_path")
 
     # --- sanity check ---
+    # The CLI's rpath points at its own directory; its libraries live in
+    # ../lib, so on Linux (no post-install rpath rewrite) we point the
+    # loader there explicitly.
     print("=== sanity check ===")
     version = subprocess.run(
-        [str(PREFIX / "bin" / "exiv2"), "--version"], capture_output=True, text=True, check=True)
+        [str(PREFIX / "bin" / "exiv2"), "--version"],
+        capture_output=True, text=True, check=True,
+        env={**os.environ, "LD_LIBRARY_PATH": str(PREFIX / "lib")})
     print(version.stdout.splitlines()[0])
 
     # --- pyexiv2 (into the venv running this script) ---
