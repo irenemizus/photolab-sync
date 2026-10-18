@@ -93,7 +93,11 @@ class SyncApiClient:
     """
 
     def __init__(self, base_url: str, *,
-                 connect_timeout: float = 5.0,
+                 # urllib3 has no separate write timeout: it applies the connect
+                 # timeout as the socket timeout during the body send. A multi-GB
+                 # upload's sendall is therefore bounded by this value, so it must
+                 # ride out server-side backpressure, not just a TCP handshake.
+                 connect_timeout: float = 300.0,
                  # Must exceed the server's worst-case response time for a
                  # large upload (its Immich upload budget + decode/write), or
                  # the client aborts before the server can answer.
