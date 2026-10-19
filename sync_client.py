@@ -336,6 +336,7 @@ class SyncClient:
         pending: list[tuple[Path, Path, str, Record, str]] = []
         temps: list[Path] = []
         count = 0
+        logged: set[tuple] = set()
         try:
             for path in self._walk():
                 rel = path.relative_to(self.root)
@@ -343,9 +344,12 @@ class SyncClient:
                 if place is None:
                     continue
                 count += 1
-                log.info("Scanning %s, %d: %s - %s...",
-                         calendar.month_name[place.month], place.year,
-                         place.event, place.subevent)
+                key = (place.year, place.month, place.event, place.subevent)
+                if key not in logged:
+                    logged.add(key)
+                    log.info("Scanning %s, %d: %s - %s...",
+                             calendar.month_name[place.month], place.year,
+                             place.event, place.subevent)
                 md = Metadata.from_file(path)
                 md.patch_from_place(place)
                 md.date_time_original = _date_time_for(md.date_time_original, place)
