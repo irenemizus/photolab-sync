@@ -444,7 +444,7 @@ class PhotolabSyncServer:
         record = Record.from_dict(body["record"])
         album_id = self._resolve_album(body.get("album"), record)
         data = base64.b64decode(body["file"])
-        log.info("upload: hash …%s album=%s size=%dB",
+        log.info("Executing UPLOAD: hash …%s to album %s (size %dB)",
                  body["hash"][-16:], body.get("album"), len(data))
         ext = _EXT_BY_CONTENT_TYPE.get(body.get("content_type") or "", ".bin")
         fd, name = tempfile.mkstemp(prefix="photolab-sync-upload-", suffix=ext)
@@ -490,7 +490,7 @@ class PhotolabSyncServer:
         h = body.get("hash")
         if not asset_id and not h:
             raise _ApiError(400, "bad_request", "delete body must carry a hash or asset_id")
-        log.info("delete: %s", asset_id or f"hash …{h[-16:]}")
+        log.info("Executing DELETE: %s", asset_id or f"hash …{h[-16:]}")
         if asset_id:
             # Targets one of several duplicate copies (§5.2), by id.
             # A trashed id is "already gone": the bulk delete would no-op
@@ -523,7 +523,7 @@ class PhotolabSyncServer:
             raise _ApiError(400, "bad_request", "move body must carry a hash and a record")
         h = body["hash"]
         record = Record.from_dict(body["record"])
-        log.info("move: hash …%s -> %s", h[-16:], body.get("album"))
+        log.info("Executing MOVE: hash …%s to album %s", h[-16:], body.get("album"))
         with self.state.lock:
             ids = self.state.asset_ids_by_hash.get(h)
             asset_id = ids[0] if ids else None
@@ -600,7 +600,7 @@ class PhotolabSyncServer:
             raise _ApiError(400, "bad_request", "album/create body must carry an identity")
         identity = body["identity"]
         name = body.get("name") or ""
-        log.info("album/create: %s (%s)", identity, name)
+        log.info("Executing CREATE_ALBUM: %s (%s)", identity, name)
         with self.state.lock:
             existing = self.state.identity_to_album.get(identity)
         if existing is not None:
@@ -627,7 +627,7 @@ class PhotolabSyncServer:
         if not body or "identity" not in body:
             raise _ApiError(400, "bad_request", "album/delete body must carry an identity")
         identity = body["identity"]
-        log.info("album/delete: %s", identity)
+        log.info("Executing DELETE_ALBUM: %s", identity)
         with self.state.lock:
             album_id = self.state.identity_to_album.pop(identity, None)
         if album_id is not None:
@@ -656,7 +656,8 @@ class PhotolabSyncServer:
             # "Misc — X" to "X", so the whole name is the subevent.
             event, subevent = MISC_EVENT, new_name
         target_identity = format_identity((source[0], source[1], event, subevent))
-        log.info("album/rename: %s -> %s (%s)", identity, new_name, target_identity)
+        log.info("Executing RENAME_ALBUM: %s to %s",
+                 display_name(source[2], source[3]), new_name)
 
         with self.state.lock:
             album_id = self.state.identity_to_album.get(identity)

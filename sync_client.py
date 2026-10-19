@@ -343,7 +343,9 @@ class SyncClient:
                 if place is None:
                     continue
                 count += 1
-                log.info("scan %d: subevent=%r %s", count, place.subevent, rel)
+                log.info("Scanning %s, %d: %s - %s...",
+                         calendar.month_name[place.month], place.year,
+                         place.event, place.subevent)
                 md = Metadata.from_file(path)
                 md.patch_from_place(place)
                 md.date_time_original = _date_time_for(md.date_time_original, place)
