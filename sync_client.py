@@ -375,17 +375,30 @@ class SyncClient:
         return local_pairs
 
     def _walk(self):
-        for path in sorted(self.root.rglob("*")):
-            if not path.is_file():
+        """Yield supported images, descending only into year-named top-level
+        directories. A top-level directory whose name is not a number cannot
+        hold a valid 7-level path, so it is skipped wholesale — scanning it is
+        slow and useless."""
+        if not self.root.is_dir():
+            log.warning("root %s is not a directory; nothing to scan", self.root)
+            return
+        for year_dir in sorted(self.root.iterdir()):
+            if not year_dir.is_dir():
                 continue
-            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            if not year_dir.name.isdigit():
+                log.info("skipping non-year directory %r", year_dir.name)
                 continue
-            rel = path.relative_to(self.root)
-            if len(rel.parts) != LEVELS + 1:
-                log.warning("skipping %s: expected %d directory levels, got %d",
-                            rel, LEVELS, len(rel.parts) - 1)
-                continue
-            yield path
+            for path in sorted(year_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                rel = path.relative_to(self.root)
+                if len(rel.parts) != LEVELS + 1:
+                    log.warning("skipping %s: expected %d directory levels, got %d",
+                                rel, LEVELS, len(rel.parts) - 1)
+                    continue
+                yield path
 
     def _parse_place(self, rel: Path) -> Place | None:
         try:

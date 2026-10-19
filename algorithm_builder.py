@@ -41,7 +41,7 @@ from enum import Enum
 
 import Levenshtein
 
-from record import EM_DASH, Record
+from record import display_name, Record
 
 # Section numbers below (e.g. §5.1) refer to docs/design-algorithm.md.
 
@@ -258,4 +258,4 @@ def _album_name(remote_pairs: dict[str, Record], identity: tuple) -> str:
 
 
 def _display_name(event, subevent) -> str:
-    return f"{event or ''}{EM_DASH}{subevent or ''}".strip()
+    return display_name(event, subevent)

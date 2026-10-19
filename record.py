@@ -33,6 +33,20 @@ from place import MONTH_NAMES
 
 EM_DASH = " \u2014 "
 
+# A "Misc" event is a catch-all bucket, not a real event name: its albums are
+# named after the subevent alone (no "Misc — " prefix).
+MISC_EVENT = "Misc"
+
+
+def display_name(event, subevent) -> str:
+    """The Immich album display name: 'event — subevent', or just 'subevent'
+    when the event is the Misc bucket."""
+    event = event or ""
+    subevent = subevent or ""
+    if event == MISC_EVENT:
+        return subevent or event
+    return f"{event}{EM_DASH}{subevent}".strip()
+
 
 @dataclass(frozen=True)
 class Record:
@@ -54,10 +68,11 @@ class Record:
 
     @property
     def album_name(self) -> str | None:
-        """The Immich album display name: 'event — subevent'."""
+        """The Immich album display name: 'event — subevent' ('subevent' alone
+        for the Misc bucket)."""
         if self.event is None or self.subevent is None:
             return None
-        return f"{self.event}{EM_DASH}{self.subevent}"
+        return display_name(self.event, self.subevent)
 
     @property
     def position(self) -> tuple:

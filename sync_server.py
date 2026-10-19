@@ -42,7 +42,7 @@ from pathlib import Path
 from immich_client import ImmichClient, ImmichError
 from content_hash import compute_content_hash
 from metadata import Metadata
-from record import EM_DASH, Record, format_identity, parse_identity
+from record import EM_DASH, MISC_EVENT, Record, display_name, format_identity, parse_identity
 
 log = logging.getLogger("photolab-sync.server")
 
@@ -116,6 +116,8 @@ def _collect(immich: ImmichClient, on_progress) -> tuple[dict[str, Record], list
         asset_ids.extend(immich.list_asset_ids_in_bucket(time_bucket))
     asset_ids = sorted(set(asset_ids))
     total = len(asset_ids)
+    log.info("collect: %d assets to process", total)
+    step = max(1, total // 10)  # log roughly every 10% of the collection
 
     record_by_asset: dict[str, Record] = {}
     asset_ids_by_hash: dict[str, list[str]] = {}
@@ -124,6 +126,8 @@ def _collect(immich: ImmichClient, on_progress) -> tuple[dict[str, Record], list
     tmpdir = Path(tempfile.mkdtemp(prefix="photolab-sync-"))
     try:
         for i, asset_id in enumerate(asset_ids):
+            if i and i % step == 0:
+                log.info("collect: %d/%d assets processed", i, total)
             path = tmpdir / f"asset-{i:06d}"
             immich.download_original(asset_id, path)
             try:
@@ -258,13 +262,14 @@ class PhotolabSyncServer:
                     return
                 self._send(status, payload)
                 server.state.log_request(method, path, status, body)
-                log.debug("%s %s -> %s", method, path, status)
+                log.info("%s %s -> %d (from %s)", method, path, status, self.address_string())
 
             def _fail(self, method: str, path: str, body, status: int,
                       code: str, message: str) -> None:
                 self._send(status, {"code": code, "message": message})
                 server.state.log_request(method, path, status, body)
-                log.warning("%s %s -> %s %s: %s", method, path, status, code, message)
+                log.warning("%s %s -> %d %s: %s (from %s)",
+                            method, path, status, code, message, self.address_string())
 
         self._httpd = ThreadingHTTPServer((self._host, self._requested_port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -371,6 +376,7 @@ class PhotolabSyncServer:
             self.state.active_key = key
             self.state.key_expires_at = time.monotonic() + KEY_TTL_SECONDS
             self.state.collect_job = None
+        log.info("sync session started (key=%s)", key)
         return 200, {"key": key, "key_ttl_seconds": KEY_TTL_SECONDS}
 
     def _ep_collect(self, handler, body) -> tuple[int, dict]:
@@ -385,6 +391,7 @@ class PhotolabSyncServer:
             self.state.collect_done = False
             self.state.collect_progress = 0.0
             self.state.collect_error = None
+        log.info("collect started (job=%s)", job)
         server = self
 
         def _worker() -> None:
@@ -396,6 +403,8 @@ class PhotolabSyncServer:
                     server.state.extra_copies = extra
                     server.state.asset_ids_by_hash = by_hash
                     server.state.identity_to_album = identity
+                log.info("collect done: %d photos, %d extra copies, %d albums",
+                         len(records), len(extra), len(identity))
             except Exception as exc:  # noqa: BLE001 — reported to the client
                 log.exception("collection failed")
                 with server.state.lock:
@@ -435,6 +444,8 @@ class PhotolabSyncServer:
         record = Record.from_dict(body["record"])
         album_id = self._resolve_album(body.get("album"), record)
         data = base64.b64decode(body["file"])
+        log.info("upload: hash …%s album=%s size=%dB",
+                 body["hash"][-16:], body.get("album"), len(data))
         ext = _EXT_BY_CONTENT_TYPE.get(body.get("content_type") or "", ".bin")
         fd, name = tempfile.mkstemp(prefix="photolab-sync-upload-", suffix=ext)
         tmp_path = Path(name)
@@ -468,6 +479,7 @@ class PhotolabSyncServer:
             self._immich.add_assets_to_album(album_id, [asset["id"]])
         with self.state.lock:
             self.state.asset_ids_by_hash.setdefault(body["hash"], []).append(asset["id"])
+        log.info("upload: hash …%s -> asset %s", body["hash"][-16:], asset["id"])
         return 200, {"ok": True, "asset_id": asset["id"]}
 
     def _ep_delete(self, handler, body) -> tuple[int, dict]:
@@ -478,6 +490,7 @@ class PhotolabSyncServer:
         h = body.get("hash")
         if not asset_id and not h:
             raise _ApiError(400, "bad_request", "delete body must carry a hash or asset_id")
+        log.info("delete: %s", asset_id or f"hash …{h[-16:]}")
         if asset_id:
             # Targets one of several duplicate copies (§5.2), by id.
             # A trashed id is "already gone": the bulk delete would no-op
@@ -510,6 +523,7 @@ class PhotolabSyncServer:
             raise _ApiError(400, "bad_request", "move body must carry a hash and a record")
         h = body["hash"]
         record = Record.from_dict(body["record"])
+        log.info("move: hash …%s -> %s", h[-16:], body.get("album"))
         with self.state.lock:
             ids = self.state.asset_ids_by_hash.get(h)
             asset_id = ids[0] if ids else None
@@ -576,6 +590,7 @@ class PhotolabSyncServer:
         self._delete_asset(asset_id)
         with self.state.lock:
             self.state.asset_ids_by_hash[h] = [new_id]
+        log.info("move: hash …%s -> asset %s (deleted old %s)", h[-16:], new_id, asset_id)
         return 200, {"ok": True, "moved": h, "asset_id": new_id}
 
     def _ep_create_album(self, handler, body) -> tuple[int, dict]:
@@ -585,6 +600,7 @@ class PhotolabSyncServer:
             raise _ApiError(400, "bad_request", "album/create body must carry an identity")
         identity = body["identity"]
         name = body.get("name") or ""
+        log.info("album/create: %s (%s)", identity, name)
         with self.state.lock:
             existing = self.state.identity_to_album.get(identity)
         if existing is not None:
@@ -611,6 +627,7 @@ class PhotolabSyncServer:
         if not body or "identity" not in body:
             raise _ApiError(400, "bad_request", "album/delete body must carry an identity")
         identity = body["identity"]
+        log.info("album/delete: %s", identity)
         with self.state.lock:
             album_id = self.state.identity_to_album.pop(identity, None)
         if album_id is not None:
@@ -632,19 +649,21 @@ class PhotolabSyncServer:
                             "album/rename body must carry an identity and a new_name")
         identity = body["identity"]
         new_name = body["new_name"]
+        source = parse_identity(identity)
         event, sep, subevent = new_name.partition(EM_DASH)
         if not sep:
-            raise _ApiError(400, "bad_request",
-                            f"cannot parse an event — subevent name from {new_name!r}")
-        source = parse_identity(identity)
+            # No dash: the target is the Misc bucket — display_name collapses
+            # "Misc — X" to "X", so the whole name is the subevent.
+            event, subevent = MISC_EVENT, new_name
         target_identity = format_identity((source[0], source[1], event, subevent))
+        log.info("album/rename: %s -> %s (%s)", identity, new_name, target_identity)
 
         with self.state.lock:
             album_id = self.state.identity_to_album.get(identity)
         if album_id is None:
             # Crashed-run fallback: the album may still exist under its old
             # display name (not mappable by collect, if it has no assets).
-            old_name = f"{source[2] or ''}{EM_DASH}{source[3] or ''}".strip()
+            old_name = display_name(source[2], source[3])
             for album in self._immich.list_albums():
                 if album.get("albumName") == old_name:
                     album_id = album["id"]
@@ -663,6 +682,7 @@ class PhotolabSyncServer:
         with self.state.lock:
             self.state.active_key = None
             self.state.collect_job = None
+        log.info("sync session stopped")
         return 200, {"ok": True}
 
 
