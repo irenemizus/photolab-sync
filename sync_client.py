@@ -335,12 +335,15 @@ class SyncClient:
         self._extensions.clear()
         pending: list[tuple[Path, Path, str, Record, str]] = []
         temps: list[Path] = []
+        count = 0
         try:
             for path in self._walk():
                 rel = path.relative_to(self.root)
                 place = self._parse_place(rel)
                 if place is None:
                     continue
+                count += 1
+                log.info("scan %d: subevent=%r %s", count, place.subevent, rel)
                 md = Metadata.from_file(path)
                 md.patch_from_place(place)
                 md.date_time_original = _date_time_for(md.date_time_original, place)
