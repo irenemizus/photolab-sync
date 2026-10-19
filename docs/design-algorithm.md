@@ -104,7 +104,8 @@ Let `local_albums` = set of 4-level identities over `L`; `remote_albums` = set o
   (Empty local albums are ignored — §8.)
 - **DELETE_ALBUM**: a remote identity **not** in `local_albums` and **not** renamed,
   emitted only once its surviving photos have been moved out (moves run before deletions,
-  §6.1). Empty remote albums are **kept as-is** (not deleted) — §8.
+  §6.1). Empty remote albums are **not** deleted by the plan (no operation targets them)
+  — they are erased at session end (§7.2).
 - **RENAME_ALBUM**: a remote identity missing locally whose **photos** now live in a
   local identity that is "close" → rename. The intended mechanism is a greedy best-match:
   score each candidate local album by a similarity ratio, sort best-first, commit so no
@@ -231,6 +232,8 @@ no-op on re-application**:
 | `RENAME_ALBUM`       | no-op if the album already has the target name               |
 
 ## 7. Pre-validation (before the plan is produced)
+
+### 7.1 Client pre-validation (the local pairs)
 The client validates `local_pairs` **before** running the algorithm. A validation failure
 is a **general error** reported to the user and **aborts the sync** — "before any
 synchronization is even started". Nothing is applied.
@@ -243,6 +246,37 @@ synchronization is even started". Nothing is applied.
     record (same event, different category/rating/…); treat as an error too.
 - **Server-side duplicates** are **not** a pre-check; they are resolved during the plan
   (§5.2), because a server-side duplicate must not by itself abort a sync.
+
+### 7.2 Server pre-validation (the album membership)
+The server validates the **remote album structure** during `collect` — after every
+asset's metadata has been read and **before** the collect result is reported to the
+client. Unlike the client pre-validation it does **not** abort the sync: it **repairs**
+the broken structure in place (every repair is idempotent and logged), so the plan that
+follows runs against a consistent album layout even when no photo's record changed at
+all.
+
+For every asset whose record carries a complete 4-level identity (§3.1):
+
+1. The asset's **correct album** is the existing album whose canonical identity equals
+   the asset's identity. An existing album's canonical identity is the **majority vote**
+   over its members' record identities (ties: the lexicographically smallest identity).
+   When several albums claim the same identity, the one with the **most members** wins
+   (ties: the smallest album id) — broken duplicates converge on a single album.
+2. If no such album exists, it is **created** with the identity's display name (§3.1).
+3. The asset is placed **in** its correct album and **out of every other album**.
+4. Every create / add / remove is **logged**.
+
+An asset whose identity is incomplete (any of the four fields missing) is **left as-is**:
+its record is completed by a `MOVE` (§8) once the client decides the photo's position.
+
+After the repair, the server's `identity → album id` map is rebuilt from the **repaired**
+state, so every operation (§6.1) resolves to the right album.
+
+**Empty albums at session end.** When a sync session ends (`design-api.md §6.4`), the
+server **erases every empty album** (an album with no assets). This removes albums
+emptied by `DELETE_ALBUM` or by the repair above, plus any stray empty album. This
+supersedes the "remote empty album is kept" corner case: an empty album now survives at
+most until the next `sync/stop`.
 
 ## 8. Corner cases (summary)
 - **New-year boundary event** → Case A (two albums) or Case B (one merged album); open
@@ -259,6 +293,7 @@ synchronization is even started". Nothing is applied.
 - **Server photo with no event and its hash NOT local** → remote-only → `DELETE`.
 - **Local duplicate** (same hash, two records) → FATAL pre-check, abort before applying (§7).
 - **Server duplicate** (same hash, two+ assets) → keep one, `DELETE` the rest (§5.2).
-- **Local empty album** → ignore + log. **Remote empty album** → keep + log.
-  - Precedence: an empty remote album is **always kept** (the empty rule wins over the
-    "identity absent locally" rule). `TODO`: confirm this precedence.
+- **Local empty album** → ignore + log. **Remote empty album** → always deleted, by one of
+  two routes: `DELETE_ALBUM` during the plan (when its identity is absent locally), or the
+  server's session-end cleanup (§7.2) — an empty album survives at most until the next
+  `sync/stop`.

@@ -101,8 +101,13 @@ Codes (non-exhaustive):
    **every** asset from Immich, download each via `GET /assets/{id}` one by one, compute the
    content SHA512 over the **pixel bit-stream** (metadata stripped, `design-metadata.md`),
    and reconstruct the **record** from its metadata.
-  - **Concurrency:** **only one** collection may run at a time. If one is already running,
-    respond `409 collection_in_progress`.
+   - After every record has been read, the server runs its **pre-validation**
+     (`design-algorithm.md §7.2`): each asset with a complete identity is placed in the
+     album of that identity and no other (missing albums are created; every repair is
+     logged), and the server's `identity → album id` resolution used by the §6.3 operations
+     reflects the repaired state.
+   - **Concurrency:** **only one** collection may run at a time. If one is already running,
+     respond `409 collection_in_progress`.
   - **Response:** `202`
     ```json
     { "job": "<id>", "status": "running", "progress": 0.0 }
@@ -211,6 +216,7 @@ Each returns `200` with a small result on success, or a JSON error otherwise.
 
 ### 6.4 `POST /v1/sync/stop`
 - **Auth:** key.
-- **Purpose:** end the session.
+- **Purpose:** end the session. Before answering, the server **erases every empty album**
+  (`design-algorithm.md §7.2`).
 - **Response:** `200`. The key is **invalidated immediately** and the session slot returns
   to `idle`, so another client may `sync/start`.

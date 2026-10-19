@@ -10,6 +10,13 @@ content hash -> asset id mapping are rebuilt from the live Immich state on
 every collect and held in memory only (design-api.md §6.2); they are then
 updated in place as operations are applied within the session.
 
+One exception to "dumb translator": the server also repairs the album
+structure itself. During collect, after every record is read, the server runs
+its pre-validation (design-algorithm.md §7.2): each asset with a complete
+identity is placed in the album of that identity and in no other (missing
+albums are created; every repair is logged). When a session ends, all empty
+albums are erased.
+
 An UPLOAD stores the client's final file bytes as-is (the client has already
 augmented the metadata, design-metadata.md — no server-side tag rewrite) into
 the target album. A MOVE fetches the asset's original, rewrites its embedded
@@ -55,6 +62,9 @@ _EXT_BY_CONTENT_TYPE = {
     "image/tiff": ".tif",
     "image/png": ".png",
 }
+
+# Membership changes are batched this many assets per Immich call.
+_ALBUM_BATCH = 500
 
 
 class _ApiError(Exception):
@@ -105,11 +115,12 @@ class _ServerState:
 
 
 def _collect(immich: ImmichClient, on_progress) -> tuple[dict[str, Record], list[dict],
-                                                        dict[str, list[str]], dict[str, str]]:
+                                                         dict[str, list[str]], dict[str, str]]:
     """One full collection (design-api.md §6.2): enumerate the whole timeline,
     download every original, recompute the content hash over the pixel
-    bit-stream, reconstruct the record from the embedded metadata, and rebuild
-    the live maps. No caching: everything is re-downloaded and re-hashed.
+    bit-stream, reconstruct the record from the embedded metadata, repair the
+    album membership (design-algorithm.md §7.2), and rebuild the live maps.
+    No caching: everything is re-downloaded and re-hashed.
     """
     asset_ids: list[str] = []
     for time_bucket, _count in immich.list_month_buckets():
@@ -121,8 +132,7 @@ def _collect(immich: ImmichClient, on_progress) -> tuple[dict[str, Record], list
 
     record_by_asset: dict[str, Record] = {}
     asset_ids_by_hash: dict[str, list[str]] = {}
-    identity_to_album: dict[str, str] = {}
-    in_album: set[str] = set()
+    albums_by_asset: dict[str, list[str]] = {}
     tmpdir = Path(tempfile.mkdtemp(prefix="photolab-sync-"))
     try:
         for i, asset_id in enumerate(asset_ids):
@@ -149,13 +159,13 @@ def _collect(immich: ImmichClient, on_progress) -> tuple[dict[str, Record], list
             asset_ids_by_hash.setdefault(compute_content_hash(data), []).append(asset_id)
             albums = immich.list_albums(asset_id=asset_id)
             if albums:
-                in_album.add(asset_id)
-                identity = record_by_asset[asset_id].album_identity
-                if identity is not None:
-                    identity_to_album[format_identity(identity)] = albums[0]["id"]
+                albums_by_asset[asset_id] = [a["id"] for a in albums]
             on_progress((i + 1) / total if total else 1.0)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+    identity_to_album = _fix_album_membership(immich, record_by_asset, albums_by_asset)
+    in_album = set(albums_by_asset)
 
     extra_copies: list[dict] = []
     records: dict[str, Record] = {}
@@ -174,6 +184,93 @@ def _pick_primary(asset_ids: list[str], in_album: set[str]) -> str:
     if len(members) == 1:
         return members[0]
     return sorted(asset_ids)[0]
+
+
+def _album_canonical_identity(member_ids: list[str],
+                              record_by_asset: dict[str, Record]) -> tuple | None:
+    """The identity an existing album is anchored to: the majority vote over
+    its members' record identities (ties broken by the lexicographically
+    smallest identity); None when no member has a resolvable identity."""
+    counts: dict[tuple, int] = {}
+    for asset_id in member_ids:
+        identity = record_by_asset[asset_id].album_identity
+        if identity is not None:
+            counts[identity] = counts.get(identity, 0) + 1
+    if not counts:
+        return None
+    return max(sorted(counts), key=lambda ident: counts[ident])
+
+
+def _fix_album_membership(immich: ImmichClient, record_by_asset: dict[str, Record],
+                          albums_by_asset: dict[str, list[str]]) -> dict[str, str]:
+    """Server pre-validation (design-algorithm.md §7.2): every asset whose
+    record carries a complete 4-level identity ends up in the album of that
+    identity, and in no other album.
+
+    An existing album's identity is the majority vote over its members'
+    identities; when several albums claim the same identity, the one with the
+    most members wins (ties: the lexicographically smallest album id), so
+    broken duplicates converge on a single album. A missing album is created
+    with the identity's display name. Assets with an incomplete identity are
+    left as-is (a MOVE will place them, §8). Every repair is logged. Returns
+    the corrected identity -> album id map.
+    """
+    members_by_album: dict[str, list[str]] = {}
+    for asset_id, album_ids in albums_by_asset.items():
+        for album_id in album_ids:
+            members_by_album.setdefault(album_id, []).append(asset_id)
+    album_names = {a["id"]: a.get("albumName") or "?" for a in immich.list_albums()}
+
+    identity_to_album: dict[str, str] = {}
+    for album_id in sorted(members_by_album):
+        identity = _album_canonical_identity(members_by_album[album_id], record_by_asset)
+        if identity is None:
+            continue
+        key = format_identity(identity)
+        current = identity_to_album.get(key)
+        if current is None \
+                or len(members_by_album[album_id]) > len(members_by_album[current]) \
+                or (len(members_by_album[album_id]) == len(members_by_album[current])
+                    and album_id < current):
+            identity_to_album[key] = album_id
+
+    adds: dict[str, list[str]] = {}
+    removals: dict[str, list[str]] = {}
+    for asset_id in sorted(record_by_asset):
+        identity = record_by_asset[asset_id].album_identity
+        if identity is None:
+            if albums_by_asset.get(asset_id):
+                log.info("album fix: asset …%s has an incomplete record; "
+                         "membership left as-is", asset_id[-16:])
+            continue
+        key = format_identity(identity)
+        target = identity_to_album.get(key)
+        if target is None:
+            name = display_name(identity[2], identity[3])
+            target = immich.create_album(name)["id"]
+            identity_to_album[key] = target
+            album_names[target] = name
+            log.info("album fix: created album %s (%s, id %s)", name, key, target)
+        current = set(albums_by_asset.get(asset_id, []))
+        if target not in current:
+            adds.setdefault(target, []).append(asset_id)
+            log.info("album fix: asset …%s -> %s (id %s)",
+                     asset_id[-16:], album_names.get(target, "?"), target)
+        for old in sorted(current - {target}):
+            removals.setdefault(old, []).append(asset_id)
+            log.info("album fix: asset …%s <- %s (id %s)",
+                     asset_id[-16:], album_names.get(old, "?"), old)
+
+    for album_id, asset_ids in sorted(adds.items()):
+        for i in range(0, len(asset_ids), _ALBUM_BATCH):
+            immich.add_assets_to_album(album_id, asset_ids[i:i + _ALBUM_BATCH])
+    for album_id, asset_ids in sorted(removals.items()):
+        for i in range(0, len(asset_ids), _ALBUM_BATCH):
+            immich.remove_assets_from_album(album_id, asset_ids[i:i + _ALBUM_BATCH])
+    if adds or removals:
+        log.info("album fix: %d asset(s) added, %d asset(s) removed from wrong albums",
+                 sum(len(v) for v in adds.values()), sum(len(v) for v in removals.values()))
+    return identity_to_album
 
 
 class PhotolabSyncServer:
@@ -678,13 +775,23 @@ class PhotolabSyncServer:
         return 200, {"ok": True, "identity": identity, "new_name": new_name}
 
     def _ep_stop_sync(self, handler, body) -> tuple[int, dict]:
-        """POST /v1/sync/stop — invalidate the key, slot back to idle (§6.4)."""
+        """POST /v1/sync/stop — invalidate the key, erase the empty albums,
+        slot back to idle (§6.4)."""
         self._require_key(handler)
         with self.state.lock:
             self.state.active_key = None
             self.state.collect_job = None
+        self._erase_empty_albums()
         log.info("sync session stopped")
         return 200, {"ok": True}
+
+    def _erase_empty_albums(self) -> None:
+        """Erase every empty album when the session ends (design-algorithm.md §7.2)."""
+        for album in self._immich.list_albums():
+            if album.get("assetCount") == 0:
+                self._immich.delete_album(album["id"])
+                log.info("album cleanup: deleted empty album %s (id %s)",
+                         album.get("albumName"), album["id"])
 
 
 def _resolve_immich_credentials(args) -> tuple[str, str]:

@@ -42,8 +42,12 @@ rely on its internal implementation details.
   from its embedded metadata;
   returns `{hash → position}` pairs. **No caching** — the full set is re-downloaded and
   re-hashed on every sync.
+- Before reporting the collect result, runs its **pre-validation**
+  (`design-algorithm.md §7.2`): each asset with a complete identity is placed in the album
+  of that identity and no other (missing albums are created; every repair is logged).
 - Translates each client atomic operation into the corresponding Immich API call, applying
   them strictly in the client-given order.
+- On `sync/stop`, erases every empty album (`design-algorithm.md §7.2`).
 
 ## High-level flow
 1. Client prepares `local_pairs = {content_hash → 7-level position}` and validates it.
@@ -52,7 +56,8 @@ rely on its internal implementation details.
 4. Client polls `GET /v1/collect/status` → `202` + `progress` (0.0–1.0) … → `200` + `remote_pairs`.
 5. Client computes the ordered operation list locally from `local_pairs` + `remote_pairs`.
 6. Client applies each operation in order (one short request per operation).
-7. Client → `POST /v1/sync/stop` → key invalidated, session released.
+7. Client → `POST /v1/sync/stop` → the server erases every empty album, the key is
+   invalidated, and the session is released.
 
 ## Key design decisions
 - **Immich is a black box.** We use its public API only; nothing depends on internals.
