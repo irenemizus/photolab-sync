@@ -49,7 +49,8 @@ from pathlib import Path
 from immich_client import ImmichClient, ImmichError
 from content_hash import compute_content_hash
 from metadata import Metadata
-from record import EM_DASH, MISC_EVENT, Record, display_name, format_identity, parse_identity
+from record import EM_DASH, MISC_EVENT, AlbumIdentity, Record, display_name, format_identity, parse_identity
+from sync_api import Response
 
 log = logging.getLogger("photolab-sync.server")
 
@@ -187,11 +188,11 @@ def _pick_primary(asset_ids: list[str], in_album: set[str]) -> str:
 
 
 def _album_canonical_identity(member_ids: list[str],
-                              record_by_asset: dict[str, Record]) -> tuple | None:
+                              record_by_asset: dict[str, Record]) -> AlbumIdentity | None:
     """The identity an existing album is anchored to: the majority vote over
     its members' record identities (ties broken by the lexicographically
     smallest identity); None when no member has a resolvable identity."""
-    counts: dict[tuple, int] = {}
+    counts: dict[AlbumIdentity, int] = {}
     for asset_id in member_ids:
         identity = record_by_asset[asset_id].album_identity
         if identity is not None:
@@ -246,7 +247,7 @@ def _fix_album_membership(immich: ImmichClient, record_by_asset: dict[str, Recor
         key = format_identity(identity)
         target = identity_to_album.get(key)
         if target is None:
-            name = display_name(identity[2], identity[3])
+            name = display_name(identity.event, identity.subevent)
             target = immich.create_album(name)["id"]
             identity_to_album[key] = target
             album_names[target] = name
@@ -349,7 +350,7 @@ class PhotolabSyncServer:
                                f"unknown endpoint: {method} {path}")
                     return
                 try:
-                    status, payload = endpoint(self, body)
+                    response = endpoint(self, body)
                 except _ApiError as exc:
                     self._fail(method, path, body, exc.status, exc.code, exc.message)
                     return
@@ -357,9 +358,9 @@ class PhotolabSyncServer:
                     self._fail(method, path, body, 500, "server_error",
                                f"Immich API error: {exc.message}")
                     return
-                self._send(status, payload)
-                server.state.log_request(method, path, status, body)
-                log.info("%s %s -> %d (from %s)", method, path, status, self.address_string())
+                self._send(response.status, response.payload)
+                server.state.log_request(method, path, response.status, body)
+                log.info("%s %s -> %d (from %s)", method, path, response.status, self.address_string())
 
             def _fail(self, method: str, path: str, body, status: int,
                       code: str, message: str) -> None:
@@ -461,7 +462,7 @@ class PhotolabSyncServer:
 
     # -- endpoint handlers ----------------------------------------------------
 
-    def _ep_start_sync(self, handler, body) -> tuple[int, dict]:
+    def _ep_start_sync(self, handler, body) -> Response:
         """POST /v1/sync/start — atomically idle -> active (§6.1)."""
         with self.state.lock:
             if self.state.active_key is not None:
@@ -474,9 +475,9 @@ class PhotolabSyncServer:
             self.state.key_expires_at = time.monotonic() + KEY_TTL_SECONDS
             self.state.collect_job = None
         log.info("sync session started (key=%s)", key)
-        return 200, {"key": key, "key_ttl_seconds": KEY_TTL_SECONDS}
+        return Response(200, {"key": key, "key_ttl_seconds": KEY_TTL_SECONDS})
 
-    def _ep_collect(self, handler, body) -> tuple[int, dict]:
+    def _ep_collect(self, handler, body) -> Response:
         """POST /v1/collect — start the collection job (§6.2)."""
         self._require_key(handler)
         with self.state.lock:
@@ -512,9 +513,9 @@ class PhotolabSyncServer:
                     server.state.collect_progress = 1.0
 
         threading.Thread(target=_worker, daemon=True).start()
-        return 202, {"job": job, "status": "running", "progress": 0.0}
+        return Response(202, {"job": job, "status": "running", "progress": 0.0})
 
-    def _ep_collect_status(self, handler, body) -> tuple[int, dict]:
+    def _ep_collect_status(self, handler, body) -> Response:
         """GET /v1/collect/status — poll the in-flight collection (§6.2)."""
         self._require_key(handler)
         with self.state.lock:
@@ -522,17 +523,17 @@ class PhotolabSyncServer:
                 raise _ApiError(404, "no_collection", "no collection has been started")
             if not self.state.collect_done:
                 # progress is a 0.0..1.0 fraction, monotonic, <1.0 until done.
-                return 202, {"status": "running", "progress": self.state.collect_progress}
+                return Response(202, {"status": "running", "progress": self.state.collect_progress})
             # finished: serve the terminal state once, then clear the slot
             self.state.collect_job = None
             self.state.collect_done = False
             if self.state.collect_error is not None:
-                return 500, {"code": "collect_failed", "message": self.state.collect_error}
+                return Response(500, {"code": "collect_failed", "message": self.state.collect_error})
             result = {h: r.to_dict() for h, r in self.state.remote_records.items()}
             extra = list(self.state.extra_copies)
-        return 200, {"status": "done", "result": result, "extra_copies": extra}
+        return Response(200, {"status": "done", "result": result, "extra_copies": extra})
 
-    def _ep_upload(self, handler, body) -> tuple[int, dict]:
+    def _ep_upload(self, handler, body) -> Response:
         """POST /v1/upload — store the client's final file as-is (§6.3)."""
         self._require_key(handler)
         if not body or not {"hash", "record", "file"} <= set(body):
@@ -577,9 +578,9 @@ class PhotolabSyncServer:
         with self.state.lock:
             self.state.asset_ids_by_hash.setdefault(body["hash"], []).append(asset["id"])
         log.info("upload: hash …%s -> asset %s", body["hash"][-16:], asset["id"])
-        return 200, {"ok": True, "asset_id": asset["id"]}
+        return Response(200, {"ok": True, "asset_id": asset["id"]})
 
-    def _ep_delete(self, handler, body) -> tuple[int, dict]:
+    def _ep_delete(self, handler, body) -> Response:
         """POST /v1/delete — delete by content hash or by asset id (§6.3)."""
         self._require_key(handler)
         body = body or {}
@@ -601,7 +602,7 @@ class PhotolabSyncServer:
                                 f"asset {asset_id} no longer exists on the server")
             self._delete_asset(asset_id)
             self._forget_asset(asset_id)
-            return 200, {"ok": True, "deleted": asset_id}
+            return Response(200, {"ok": True, "deleted": asset_id})
         with self.state.lock:
             ids = list(self.state.asset_ids_by_hash.pop(h, []))
         if not ids:
@@ -609,9 +610,9 @@ class PhotolabSyncServer:
                             f"no asset with content hash {h[:16]}… on the server")
         for aid in ids:
             self._delete_asset(aid)
-        return 200, {"ok": True, "deleted": h}
+        return Response(200, {"ok": True, "deleted": h})
 
-    def _ep_move(self, handler, body) -> tuple[int, dict]:
+    def _ep_move(self, handler, body) -> Response:
         """POST /v1/move — rewrite the metadata, re-home into the target
         album, delete the initial file (§6.3). The pixels are untouched, so
         the content hash stays invariant."""
@@ -683,14 +684,14 @@ class PhotolabSyncServer:
                 # current one, so there is nothing to delete.
                 with self.state.lock:
                     self.state.asset_ids_by_hash[h] = [new_id]
-                return 200, {"ok": True, "moved": h, "asset_id": new_id}
+                return Response(200, {"ok": True, "moved": h, "asset_id": new_id})
         self._delete_asset(asset_id)
         with self.state.lock:
             self.state.asset_ids_by_hash[h] = [new_id]
         log.info("move: hash …%s -> asset %s (deleted old %s)", h[-16:], new_id, asset_id)
-        return 200, {"ok": True, "moved": h, "asset_id": new_id}
+        return Response(200, {"ok": True, "moved": h, "asset_id": new_id})
 
-    def _ep_create_album(self, handler, body) -> tuple[int, dict]:
+    def _ep_create_album(self, handler, body) -> Response:
         """POST /v1/album/create (§6.3)."""
         self._require_key(handler)
         if not body or "identity" not in body:
@@ -701,8 +702,8 @@ class PhotolabSyncServer:
         with self.state.lock:
             existing = self.state.identity_to_album.get(identity)
         if existing is not None:
-            return 200, {"ok": True, "identity": identity, "name": name,
-                         "album_id": existing}
+            return Response(200, {"ok": True, "identity": identity, "name": name,
+                                  "album_id": existing})
         # Idempotent across a crashed run: an interrupted run may have left an
         # (still empty) album with this display name — adopt it instead of
         # creating a duplicate.
@@ -710,15 +711,15 @@ class PhotolabSyncServer:
             if album.get("albumName") == name:
                 with self.state.lock:
                     self.state.identity_to_album[identity] = album["id"]
-                return 200, {"ok": True, "identity": identity, "name": name,
-                             "album_id": album["id"]}
+                return Response(200, {"ok": True, "identity": identity, "name": name,
+                                      "album_id": album["id"]})
         album = self._immich.create_album(name)
         with self.state.lock:
             self.state.identity_to_album[identity] = album["id"]
-        return 200, {"ok": True, "identity": identity, "name": name,
-                     "album_id": album["id"]}
+        return Response(200, {"ok": True, "identity": identity, "name": name,
+                              "album_id": album["id"]})
 
-    def _ep_delete_album(self, handler, body) -> tuple[int, dict]:
+    def _ep_delete_album(self, handler, body) -> Response:
         """POST /v1/album/delete (§6.3)."""
         self._require_key(handler)
         if not body or "identity" not in body:
@@ -734,9 +735,9 @@ class PhotolabSyncServer:
                 if exc.status not in (400, 404):  # v3: unknown album -> 400
                     raise
                 log.warning("album %s already gone on the server", album_id)
-        return 200, {"ok": True, "identity": identity}
+        return Response(200, {"ok": True, "identity": identity})
 
-    def _ep_rename_album(self, handler, body) -> tuple[int, dict]:
+    def _ep_rename_album(self, handler, body) -> Response:
         """POST /v1/album/rename (§6.3). A rename changes only the
         event/subevent part: the source identity's year/month are kept and the
         identity mapping is updated to the new display name."""
@@ -752,29 +753,29 @@ class PhotolabSyncServer:
             # No dash: the target is the Misc bucket — display_name collapses
             # "Misc — X" to "X", so the whole name is the subevent.
             event, subevent = MISC_EVENT, new_name
-        target_identity = format_identity((source[0], source[1], event, subevent))
+        target_identity = format_identity(AlbumIdentity(source.year, source.month, event, subevent))
         log.info("Executing RENAME_ALBUM: %s to %s",
-                 display_name(source[2], source[3]), new_name)
+                  display_name(source.event, source.subevent), new_name)
 
         with self.state.lock:
             album_id = self.state.identity_to_album.get(identity)
         if album_id is None:
             # Crashed-run fallback: the album may still exist under its old
             # display name (not mappable by collect, if it has no assets).
-            old_name = display_name(source[2], source[3])
+            old_name = display_name(source.event, source.subevent)
             for album in self._immich.list_albums():
                 if album.get("albumName") == old_name:
                     album_id = album["id"]
                     break
         if album_id is None:
-            return 200, {"ok": True, "identity": identity, "new_name": new_name}
+            return Response(200, {"ok": True, "identity": identity, "new_name": new_name})
         self._immich.update_album(album_id, name=new_name)
         with self.state.lock:
             self.state.identity_to_album.pop(identity, None)
             self.state.identity_to_album[target_identity] = album_id
-        return 200, {"ok": True, "identity": identity, "new_name": new_name}
+        return Response(200, {"ok": True, "identity": identity, "new_name": new_name})
 
-    def _ep_stop_sync(self, handler, body) -> tuple[int, dict]:
+    def _ep_stop_sync(self, handler, body) -> Response:
         """POST /v1/sync/stop — invalidate the key, erase the empty albums,
         slot back to idle (§6.4)."""
         self._require_key(handler)
@@ -783,7 +784,7 @@ class PhotolabSyncServer:
             self.state.collect_job = None
         self._erase_empty_albums()
         log.info("sync session stopped")
-        return 200, {"ok": True}
+        return Response(200, {"ok": True})
 
     def _erase_empty_albums(self) -> None:
         """Erase every empty album when the session ends (design-algorithm.md §7.2)."""

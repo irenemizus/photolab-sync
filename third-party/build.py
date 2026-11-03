@@ -75,7 +75,7 @@ def ensure_target_setuptools() -> None:
 
 
 def build_venv_python() -> str:
-    return str(BUILD_VENV / "bin" / "python")
+    return str(BUILD_VENV / "bin" / "python3")
 
 
 def ensure_build_venv() -> None:

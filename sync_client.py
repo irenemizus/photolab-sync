@@ -32,6 +32,7 @@ from pathlib import Path
 import requests
 
 from algorithm_builder import (
+    LocalPair,
     Operation,
     OperationType,
     build_sync_algorithm,
@@ -40,7 +41,7 @@ from algorithm_builder import (
 from metadata import Metadata
 from place import Place
 from content_hash import compute_content_hash
-from record import Record, format_identity
+from record import AlbumIdentity, Record, format_identity
 
 log = logging.getLogger("photolab-sync.client")
 
@@ -172,14 +173,14 @@ class SyncApiClient:
         }
         self._request("POST", "/v1/move", body=body)
 
-    def create_album(self, identity: tuple, name: str) -> None:
+    def create_album(self, identity: AlbumIdentity, name: str) -> None:
         self._request("POST", "/v1/album/create",
                       body={"identity": format_identity(identity), "name": name})
 
-    def delete_album(self, identity: tuple) -> None:
+    def delete_album(self, identity: AlbumIdentity) -> None:
         self._request("POST", "/v1/album/delete", body={"identity": format_identity(identity)})
 
-    def rename_album(self, identity: tuple, new_name: str) -> None:
+    def rename_album(self, identity: AlbumIdentity, new_name: str) -> None:
         self._request("POST", "/v1/album/rename",
                       body={"identity": format_identity(identity), "new_name": new_name})
 
@@ -228,6 +229,18 @@ class SyncResult:
             return "no operations"
         return ", ".join(f"{self.counts[t]} {t.value}"
                          for t in OperationType if t in self.counts)
+
+
+@dataclass(frozen=True)
+class PreparedFile:
+    """One local image prepared for upload: its original path, the temp copy
+    carrying the augmented metadata, that copy's content hash, its record, and
+    the file extension."""
+    path: Path
+    tmp: Path
+    hash: str
+    record: Record
+    ext: str
 
 
 def _date_time_for(file_dt: datetime | None, place: Place) -> datetime:
@@ -333,10 +346,10 @@ class SyncClient:
         """
         self._files.clear()
         self._extensions.clear()
-        pending: list[tuple[Path, Path, str, Record, str]] = []
+        pending: list[PreparedFile] = []
         temps: list[Path] = []
         count = 0
-        logged: set[tuple] = set()
+        logged: set[AlbumIdentity] = set()
         try:
             for path in self._walk():
                 rel = path.relative_to(self.root)
@@ -344,7 +357,7 @@ class SyncClient:
                 if place is None:
                     continue
                 count += 1
-                key = (place.year, place.month, place.event, place.subevent)
+                key = AlbumIdentity(place.year, place.month, place.event, place.subevent)
                 if key not in logged:
                     logged.add(key)
                     log.info("Scanning %s, %d: %s - %s...",
@@ -366,20 +379,20 @@ class SyncClient:
                     rating=md.rating,
                     date_time_original=md.date_time_original,
                 )
-                pending.append((path, tmp, h, rec, path.suffix.lower()))
+                pending.append(PreparedFile(path, tmp, h, rec, path.suffix.lower()))
             # Fatal pre-check (design-algorithm.md §7) BEFORE anything is
             # applied — even the local metadata write-backs below wait for it.
-            validate_local_pairs([(h, rec) for _, _, h, rec, _ in pending])
+            validate_local_pairs([LocalPair(p.hash, p.record) for p in pending])
         except BaseException:
             for tmp in temps:
                 tmp.unlink(missing_ok=True)
             raise
-        for path, tmp, h, rec, ext in pending:
-            data = tmp.read_bytes()
-            os.replace(tmp, path)
-            self._files[h] = data
-            self._extensions[h] = ext
-        local_pairs = {h: rec for _, _, h, rec, _ in pending}
+        for p in pending:
+            data = p.tmp.read_bytes()
+            os.replace(p.tmp, p.path)
+            self._files[p.hash] = data
+            self._extensions[p.hash] = p.ext
+        local_pairs = {p.hash: p.record for p in pending}
         log.info("scanned %d images from %s", len(local_pairs), self.root)
         return local_pairs
 

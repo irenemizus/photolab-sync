@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from metadata import Metadata
-from record import format_identity
+from record import AlbumIdentity, format_identity
 from sync_server import PhotolabSyncServer, _collect
 
 
@@ -103,13 +103,15 @@ def run_collect(fake):
 # -- collect: album-membership repair (§7.2) -------------------------------------
 
 def test_collect_keeps_correct_membership(tmp_path):
-    a1 = (2022, 7, "E", "S1")
-    a2 = (2022, 8, "E", "S2")
+    a1 = AlbumIdentity(2022, 7, "E", "S1")
+    a2 = AlbumIdentity(2022, 8, "E", "S2")
     fake = FakeImmich({})
-    x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30), **{
-        "year": a1[0], "month": a1[1], "event": a1[2], "subevent": a1[3]}))
-    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60), **{
-        "year": a2[0], "month": a2[1], "event": a2[2], "subevent": a2[3]}))
+    x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30),
+                                    year=a1.year, month=a1.month,
+                                    event=a1.event, subevent=a1.subevent))
+    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60),
+                                    year=a2.year, month=a2.month,
+                                    event=a2.event, subevent=a2.subevent))
     fake.buckets = {"2022-07": [x1], "2022-08": [x2]}
     alb1 = fake.make_album("E — S1", [x1])
     alb2 = fake.make_album("E — S2", [x2])
@@ -123,17 +125,21 @@ def test_collect_keeps_correct_membership(tmp_path):
 
 
 def test_collect_moves_misfiled_asset_to_existing_album(tmp_path):
-    s1 = (2022, 7, "E", "S1")
-    s2 = (2022, 7, "E", "S2")
+    s1 = AlbumIdentity(2022, 7, "E", "S1")
+    s2 = AlbumIdentity(2022, 7, "E", "S2")
     fake = FakeImmich({})
-    x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30), **{
-        "year": s1[0], "month": s1[1], "event": s1[2], "subevent": s1[3]}))
-    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60), **{
-        "year": s1[0], "month": s1[1], "event": s1[2], "subevent": s1[3]}))
-    x3 = fake.make_asset(asset_data(tmp_path, (70, 80, 90), **{
-        "year": s2[0], "month": s2[1], "event": s2[2], "subevent": s2[3]}))
-    x4 = fake.make_asset(asset_data(tmp_path, (100, 110, 120), **{
-        "year": s2[0], "month": s2[1], "event": s2[2], "subevent": s2[3]}))
+    x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30),
+                                    year=s1.year, month=s1.month,
+                                    event=s1.event, subevent=s1.subevent))
+    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60),
+                                    year=s1.year, month=s1.month,
+                                    event=s1.event, subevent=s1.subevent))
+    x3 = fake.make_asset(asset_data(tmp_path, (70, 80, 90),
+                                    year=s2.year, month=s2.month,
+                                    event=s2.event, subevent=s2.subevent))
+    x4 = fake.make_asset(asset_data(tmp_path, (100, 110, 120),
+                                    year=s2.year, month=s2.month,
+                                    event=s2.event, subevent=s2.subevent))
     fake.buckets = {"2022-07": [x1, x2, x3, x4]}
     # x1 (identity S1) is misfiled in the S2 album
     alb1 = fake.make_album("E — S1", [x2])
@@ -152,13 +158,15 @@ def test_collect_moves_misfiled_asset_to_existing_album(tmp_path):
 
 
 def test_collect_creates_missing_albums(tmp_path):
-    s1 = (2022, 7, "E", "S1")
-    misc = (2010, 6, "Misc", "X")
+    s1 = AlbumIdentity(2022, 7, "E", "S1")
+    misc = AlbumIdentity(2010, 6, "Misc", "X")
     fake = FakeImmich({"2022-07": [], "2010-06": []})
-    x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30), **{
-        "year": s1[0], "month": s1[1], "event": s1[2], "subevent": s1[3]}))
-    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60), **{
-        "year": misc[0], "month": misc[1], "event": misc[2], "subevent": misc[3]}))
+    x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30),
+                                    year=s1.year, month=s1.month,
+                                    event=s1.event, subevent=s1.subevent))
+    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60),
+                                    year=misc.year, month=misc.month,
+                                    event=misc.event, subevent=misc.subevent))
     fake.buckets = {"2022-07": [x1], "2010-06": [x2]}
     # both assets are in no album at all
 
@@ -173,12 +181,13 @@ def test_collect_creates_missing_albums(tmp_path):
 
 
 def test_collect_converges_duplicate_identity_albums(tmp_path):
-    s1 = (2022, 7, "E", "S1")
+    s1 = AlbumIdentity(2022, 7, "E", "S1")
     fake = FakeImmich({"2022-07": []})
     assets = []
     for color in ((10, 20, 30), (40, 50, 60), (70, 80, 90)):
-        assets.append(fake.make_asset(asset_data(tmp_path, color, **{
-            "year": s1[0], "month": s1[1], "event": s1[2], "subevent": s1[3]})))
+        assets.append(fake.make_asset(asset_data(tmp_path, color,
+                                                 year=s1.year, month=s1.month,
+                                                 event=s1.event, subevent=s1.subevent)))
     fake.buckets = {"2022-07": assets}
     # the same identity lives in two albums: 2 members vs 1 member
     alb_a = fake.make_album("E — S1", assets[:2])
@@ -194,11 +203,12 @@ def test_collect_converges_duplicate_identity_albums(tmp_path):
 
 
 def test_collect_leaves_incomplete_record_assets_alone(tmp_path):
-    s1 = (2022, 7, "E", "S1")
+    s1 = AlbumIdentity(2022, 7, "E", "S1")
     fake = FakeImmich({"2022-07": []})
     x1 = fake.make_asset(asset_data(tmp_path, (10, 20, 30)))  # no metadata at all
-    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60), **{
-        "year": s1[0], "month": s1[1], "event": s1[2], "subevent": s1[3]}))
+    x2 = fake.make_asset(asset_data(tmp_path, (40, 50, 60),
+                                    year=s1.year, month=s1.month,
+                                    event=s1.event, subevent=s1.subevent))
     fake.buckets = {"2022-07": [x1, x2]}
     # both sit in one mixed album; the complete record anchors it to S1
     alb = fake.make_album("E — S1", [x1, x2])

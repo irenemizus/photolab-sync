@@ -25,6 +25,8 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from sync_api import Response
+
 log = logging.getLogger("photolab-sync.stub-server")
 
 # Session inactivity TTL (design-api.md §2): sliding, refreshed on every
@@ -132,13 +134,13 @@ class TestStubSyncServer:
                                        f"unknown endpoint: {method} {path}")
                     return
                 try:
-                    status, payload = handler(self, state, body)
+                    response = handler(self, state, body)
                 except _ApiError as exc:
                     self._handle_error(method, path, body, exc.status, exc.code, exc.message)
                     return
-                self._send(status, payload)
-                state.log_request(method, path, status, body)
-                log.debug("%s %s -> %s", method, path, status)
+                self._send(response.status, response.payload)
+                state.log_request(method, path, response.status, body)
+                log.debug("%s %s -> %s", method, path, response.status)
 
             def _handle_error(self, method: str, path: str, body, status: int,
                               code: str, message: str) -> None:
@@ -198,7 +200,7 @@ class _ApiError(Exception):
 
 # -- endpoint handlers ---------------------------------------------------------
 
-def _ep_start_sync(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_start_sync(handler, state: _ServerState, body) -> Response:
     """POST /v1/sync/start — atomically idle -> active (§6.1)."""
     with state.lock:
         if state.active_key is not None:
@@ -210,10 +212,10 @@ def _ep_start_sync(handler, state: _ServerState, body) -> tuple[int, dict]:
         state.active_key = key
         state.key_expires_at = time.monotonic() + KEY_TTL_SECONDS
         state.collect_job = None
-    return 200, {"key": key, "key_ttl_seconds": KEY_TTL_SECONDS}
+    return Response(200, {"key": key, "key_ttl_seconds": KEY_TTL_SECONDS})
 
 
-def _ep_collect(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_collect(handler, state: _ServerState, body) -> Response:
     """POST /v1/collect — start the (stub) collection job (§6.2)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
@@ -224,10 +226,10 @@ def _ep_collect(handler, state: _ServerState, body) -> tuple[int, dict]:
         job = uuid.uuid4().hex
         state.collect_job = job
         state.collect_done_polls = 0
-    return 202, {"job": job, "status": "running", "progress": 0.0}
+    return Response(202, {"job": job, "status": "running", "progress": 0.0})
 
 
-def _ep_collect_status(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_collect_status(handler, state: _ServerState, body) -> Response:
     """GET /v1/collect/status — poll the (stub) collection (§6.2).
 
     Reports an empty remote set: no photos, no extra copies.
@@ -241,12 +243,12 @@ def _ep_collect_status(handler, state: _ServerState, body) -> tuple[int, dict]:
             state.collect_done_polls += 1
             # progress is a 0.0..1.0 fraction, monotonic, <1.0 until done.
             progress = min(0.99, state.collect_done_polls * 0.5)
-            return 202, {"status": "running", "progress": progress}
+            return Response(202, {"status": "running", "progress": progress})
         state.collect_job = None
-        return 200, {"status": "done", "result": {}, "extra_copies": []}
+        return Response(200, {"status": "done", "result": {}, "extra_copies": []})
 
 
-def _ep_upload(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_upload(handler, state: _ServerState, body) -> Response:
     """POST /v1/upload — accept the final file, keep a copy of the payload (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
@@ -262,66 +264,66 @@ def _ep_upload(handler, state: _ServerState, body) -> tuple[int, dict]:
             # file_size is the decoded payload size, not the base64 string length
             "file_size": len(base64.b64decode(body.get("file", ""))),
         }
-    return 200, {"ok": True, "asset_id": asset_id}
+    return Response(200, {"ok": True, "asset_id": asset_id})
 
 
-def _ep_delete(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_delete(handler, state: _ServerState, body) -> Response:
     """POST /v1/delete — pretend to delete (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     target = (body or {}).get("hash") or (body or {}).get("asset_id")
     if target is None:
         raise _ApiError(400, "bad_request", "delete body must carry a hash or asset_id")
-    return 200, {"ok": True, "deleted": target}
+    return Response(200, {"ok": True, "deleted": target})
 
 
-def _ep_move(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_move(handler, state: _ServerState, body) -> Response:
     """POST /v1/move — pretend to update the asset's metadata (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "hash" not in body:
         raise _ApiError(400, "bad_request", "move body must carry a hash")
-    return 200, {"ok": True, "moved": body["hash"],
-                 "album": body.get("album"),
-                 "record": body.get("record")}
+    return Response(200, {"ok": True, "moved": body["hash"],
+                          "album": body.get("album"),
+                          "record": body.get("record")})
 
 
-def _ep_create_album(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_create_album(handler, state: _ServerState, body) -> Response:
     """POST /v1/album/create (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
         raise _ApiError(400, "bad_request", "album/create body must carry an identity")
-    return 200, {"ok": True, "identity": body["identity"], "name": body.get("name")}
+    return Response(200, {"ok": True, "identity": body["identity"], "name": body.get("name")})
 
 
-def _ep_delete_album(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_delete_album(handler, state: _ServerState, body) -> Response:
     """POST /v1/album/delete (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
         raise _ApiError(400, "bad_request", "album/delete body must carry an identity")
-    return 200, {"ok": True, "identity": body["identity"]}
+    return Response(200, {"ok": True, "identity": body["identity"]})
 
 
-def _ep_rename_album(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_rename_album(handler, state: _ServerState, body) -> Response:
     """POST /v1/album/rename (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
         raise _ApiError(400, "bad_request", "album/rename body must carry an identity")
-    return 200, {"ok": True, "identity": body["identity"],
-                 "new_name": body.get("new_name")}
+    return Response(200, {"ok": True, "identity": body["identity"],
+                          "new_name": body.get("new_name")})
 
 
-def _ep_stop_sync(handler, state: _ServerState, body) -> tuple[int, dict]:
+def _ep_stop_sync(handler, state: _ServerState, body) -> Response:
     """POST /v1/sync/stop — invalidate the key, slot back to idle (§6.4)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
         raise _ApiError(401, "invalid_key", "missing or invalid session key")
     with state.lock:
         state.active_key = None
         state.collect_job = None
-    return 200, {"ok": True}
+    return Response(200, {"ok": True})
 
 
 _ENDPOINTS = {

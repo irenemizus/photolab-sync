@@ -41,7 +41,7 @@ from enum import Enum
 
 import Levenshtein
 
-from record import display_name, Record
+from record import AlbumIdentity, display_name, Record
 
 # Section numbers below (e.g. §5.1) refer to docs/design-algorithm.md.
 
@@ -57,6 +57,23 @@ class OperationType(Enum):
 
 class LocalValidationError(Exception):
     """Fatal pre-check failure: the local set is invalid, the sync must not start (§7)."""
+
+
+@dataclass(frozen=True)
+class LocalPair:
+    """One scanned local image: its content hash and its record (the raw scan
+    result, before deduplication into a dict, §7)."""
+    hash: str
+    record: Record
+
+
+@dataclass(frozen=True)
+class RenameCandidate:
+    """A rename match candidate (§3.2): the similarity ratio between the
+    source (remote) identity and the target (local) identity."""
+    ratio: float
+    source: AlbumIdentity
+    target: AlbumIdentity
 
 
 @dataclass
@@ -83,7 +100,7 @@ class Operation:
     asset_id: str | None = None
     record: Record | None = None
     from_record: Record | None = None
-    album: tuple | None = None
+    album: AlbumIdentity | None = None
     album_name: str | None = None
 
     def __str__(self) -> str:
@@ -104,32 +121,32 @@ class Operation:
         return f"OP {self.operation_type} {hshort}"
 
 
-def validate_local_pairs(pairs: list[tuple[str, Record]]) -> None:
+def validate_local_pairs(pairs: list[LocalPair]) -> None:
     """Fatal pre-check on the local set (design-algorithm.md §7).
 
-    `pairs` is the raw scan result: one (hash, record) per local image, BEFORE
-    deduplication into a dict. A single content hash MUST map to exactly one
-    record. If the same hash appears more than once — under a different record
-    (a photo in two events) or even under the same record (a plain duplicate
-    file) — this is FATAL and the sync does not start.
+    `pairs` is the raw scan result: one LocalPair (hash, record) per local
+    image, BEFORE deduplication into a dict. A single content hash MUST map
+    to exactly one record. If the same hash appears more than once — under a
+    different record (a photo in two events) or even under the same record
+    (a plain duplicate file) — this is FATAL and the sync does not start.
 
     Server-side duplicates are NOT a pre-check (§5.2): they are resolved
     during the plan, so a server-side duplicate must not by itself abort a
     sync.
     """
     seen: dict[str, Record] = {}
-    for h, record in pairs:
-        if h in seen:
-            if seen[h] == record:
+    for pair in pairs:
+        if pair.hash in seen:
+            if seen[pair.hash] == pair.record:
                 raise LocalValidationError(
-                    f"duplicate content: content hash {h[:16]}… appears twice with the "
-                    f"same record ({record}) — duplicates are not tolerated"
+                    f"duplicate content: content hash {pair.hash[:16]}… appears twice with the "
+                    f"same record ({pair.record}) — duplicates are not tolerated"
                 )
             raise LocalValidationError(
-                f"duplicate content: content hash {h[:16]}… is in two events: "
-                f"{seen[h]} and {record}"
+                f"duplicate content: content hash {pair.hash[:16]}… is in two events: "
+                f"{seen[pair.hash]} and {pair.record}"
             )
-        seen[h] = record
+        seen[pair.hash] = pair.record
 
 
 def build_sync_algorithm(
@@ -193,7 +210,7 @@ def build_sync_algorithm(
     # source's year/month (a pure year/month change is NOT a rename — it is
     # create + delete, §3.2) and its identity is free on the remote side
     # (renaming into an existing album would collide).
-    rename_candidates = []
+    rename_candidates: list[RenameCandidate] = []
     for missing in sorted(remote_albums - local_albums):
         names = _album_name(remote_pairs, missing)
         candidate_albums = set()
@@ -203,25 +220,26 @@ def build_sync_algorithm(
         for candidate in candidate_albums:
             if candidate in remote_albums:
                 continue
-            if (candidate[0], candidate[1]) != (missing[0], missing[1]):
+            if (candidate.year, candidate.month) != (missing.year, missing.month):
                 continue
-            ratio = Levenshtein.ratio(_display_name(*candidate[2:]), names)
-            rename_candidates.append((ratio, missing, candidate))
+            ratio = Levenshtein.ratio(_display_name(candidate.event, candidate.subevent), names)
+            rename_candidates.append(RenameCandidate(ratio, missing, candidate))
 
     # Greedy best-match: best ratio first; no album is renamed twice and no two
     # albums are renamed into the same target. The names break ties stably.
-    rename_candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
-    album_renames: dict[tuple, tuple] = {}   # source identity -> target identity
-    taken_target_ids: set[tuple] = set()
-    for ratio, source, target in rename_candidates:
-        if source in album_renames or target in taken_target_ids:
+    rename_candidates.sort(key=lambda c: (-c.ratio, c.source, c.target))
+    album_renames: dict[AlbumIdentity, AlbumIdentity] = {}   # source identity -> target identity
+    taken_target_ids: set[AlbumIdentity] = set()
+    for candidate in rename_candidates:
+        if candidate.source in album_renames or candidate.target in taken_target_ids:
             continue
-        album_renames[source] = target
-        taken_target_ids.add(target)
+        album_renames[candidate.source] = candidate.target
+        taken_target_ids.add(candidate.target)
 
     rename_ops = [
         Operation(OperationType.RENAME_ALBUM, album=source,
-                  album_name=_display_name(*album_renames[source][2:]))
+                  album_name=_display_name(album_renames[source].event,
+                                           album_renames[source].subevent))
         for source in sorted(album_renames)
     ]
 
@@ -231,7 +249,7 @@ def build_sync_algorithm(
     rename_targets = set(album_renames.values())
     create_ops = [
         Operation(OperationType.CREATE_ALBUM, album=identity,
-                  album_name=_display_name(*identity[2:]))
+                  album_name=_display_name(identity.event, identity.subevent))
         for identity in sorted(local_albums - remote_albums - rename_targets)
     ]
 
@@ -249,12 +267,12 @@ def build_sync_algorithm(
     return deletions + rename_ops + create_ops + moves + delete_album_ops + uploads
 
 
-def _album_name(remote_pairs: dict[str, Record], identity: tuple) -> str:
+def _album_name(remote_pairs: dict[str, Record], identity: AlbumIdentity) -> str:
     """The display name of a remote album, from any of its records."""
     for r in remote_pairs.values():
         if r.album_identity == identity:
             return _display_name(r.event, r.subevent)
-    return _display_name(identity[2], identity[3])
+    return _display_name(identity.event, identity.subevent)
 
 
 def _display_name(event, subevent) -> str:

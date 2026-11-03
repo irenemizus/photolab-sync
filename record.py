@@ -48,6 +48,19 @@ def display_name(event, subevent) -> str:
     return f"{event}{EM_DASH}{subevent}".strip()
 
 
+@dataclass(frozen=True, order=True)
+class AlbumIdentity:
+    """The 4-level identity of an album (levels 1-4): (year, month, event,
+    subevent). Ordering and hashing match the plain 4-tuple it replaced."""
+    year: int
+    month: int
+    event: str
+    subevent: str
+
+    def __str__(self) -> str:
+        return str((self.year, self.month, self.event, self.subevent))
+
+
 @dataclass(frozen=True)
 class Record:
     year: int | None = None
@@ -60,11 +73,11 @@ class Record:
     date_time_original: datetime | None = None
 
     @property
-    def album_identity(self) -> tuple | None:
+    def album_identity(self) -> AlbumIdentity | None:
         """The 4-level identity (year, month, event, subevent), or None if any part is missing."""
         if None in (self.year, self.month, self.event, self.subevent):
             return None
-        return (self.year, self.month, self.event, self.subevent)
+        return AlbumIdentity(self.year, self.month, self.event, self.subevent)
 
     @property
     def album_name(self) -> str | None:
@@ -131,12 +144,11 @@ class Record:
         return f"{self.to_path_string()} [{dtp}]"
 
 
-def format_identity(identity: tuple) -> str:
+def format_identity(identity: AlbumIdentity) -> str:
     """'year/month/event/subevent' — the album addressing form used in the API (design-api.md §6.3)."""
-    year, month, event, subevent = identity
-    return f"{year}/{month}/{event}/{subevent}"
+    return f"{identity.year}/{identity.month}/{identity.event}/{identity.subevent}"
 
 
-def parse_identity(s: str) -> tuple:
+def parse_identity(s: str) -> AlbumIdentity:
     year_s, month_s, event, subevent = s.split("/", 3)
-    return (int(year_s), int(month_s), event, subevent)
+    return AlbumIdentity(int(year_s), int(month_s), event, subevent)

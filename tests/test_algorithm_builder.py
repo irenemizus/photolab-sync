@@ -5,13 +5,14 @@ from datetime import datetime
 import pytest
 
 from algorithm_builder import (
+    LocalPair,
     LocalValidationError,
     Operation,
     OperationType,
     build_sync_algorithm,
     validate_local_pairs,
 )
-from record import Record
+from record import AlbumIdentity, Record
 
 
 def rec(year, month, event, subevent, category="c", supp="s", rating=3,
@@ -20,7 +21,7 @@ def rec(year, month, event, subevent, category="c", supp="s", rating=3,
 
 
 def A(y, m, e, s):
-    return (y, m, e, s)
+    return AlbumIdentity(y, m, e, s)
 
 
 def types(ops):
@@ -37,18 +38,18 @@ def test_validate_rejects_same_hash_two_records():
     r1 = rec(2026, 4, "A", "B")
     r2 = rec(2026, 4, "A", "C")
     with pytest.raises(LocalValidationError):
-        validate_local_pairs([("h1", r1), ("h1", r2)])
+        validate_local_pairs([LocalPair("h1", r1), LocalPair("h1", r2)])
 
 
 def test_validate_rejects_plain_duplicate():
     r1 = rec(2026, 4, "A", "B")
     with pytest.raises(LocalValidationError):
-        validate_local_pairs([("h1", r1), ("h1", r1)])
+        validate_local_pairs([LocalPair("h1", r1), LocalPair("h1", r1)])
 
 
 def test_validate_accepts_distinct_hashes():
-    validate_local_pairs([("h1", rec(2026, 4, "A", "B")),
-                          ("h2", rec(2026, 4, "A", "C"))])
+    validate_local_pairs([LocalPair("h1", rec(2026, 4, "A", "B")),
+                          LocalPair("h2", rec(2026, 4, "A", "C"))])
 
 
 # --- basic phases (§5) ----------------------------------------------------------
