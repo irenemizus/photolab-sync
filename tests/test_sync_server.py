@@ -8,7 +8,8 @@ from PIL import Image
 
 from metadata import Metadata
 from record import AlbumIdentity, format_identity
-from sync_server import PhotolabSyncServer, _collect
+from server_collect import _collect
+from sync_server import PhotolabSyncServer
 
 
 class FakeImmich:

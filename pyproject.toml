@@ -21,4 +21,5 @@ backend-path = ["."]
 [tool.setuptools]
   py-modules = ["metadata", "place", "record", "content_hash",
                 "algorithm_builder", "sync_client", "stub_sync_server",
-                "immich_client", "sync_server"]
+                "immich_client", "sync_server", "sync_api",
+                "server_collect", "server_endpoints", "server_http"]

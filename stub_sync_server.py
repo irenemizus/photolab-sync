@@ -25,13 +25,9 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sync_api import Response
+from sync_api import ApiError, KEY_TTL_SECONDS, Response
 
 log = logging.getLogger("photolab-sync.stub-server")
-
-# Session inactivity TTL (design-api.md §2): sliding, refreshed on every
-# authenticated request.
-KEY_TTL_SECONDS = 60
 
 
 class _ServerState:
@@ -135,7 +131,7 @@ class TestStubSyncServer:
                     return
                 try:
                     response = handler(self, state, body)
-                except _ApiError as exc:
+                except ApiError as exc:
                     self._handle_error(method, path, body, exc.status, exc.code, exc.message)
                     return
                 self._send(response.status, response.payload)
@@ -190,14 +186,6 @@ class TestStubSyncServer:
         self.state.running_polls_before_done = max(0, n)
 
 
-class _ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(f"HTTP {status} [{code}]: {message}")
-        self.status = status
-        self.code = code
-        self.message = message
-
-
 # -- endpoint handlers ---------------------------------------------------------
 
 def _ep_start_sync(handler, state: _ServerState, body) -> Response:
@@ -207,7 +195,7 @@ def _ep_start_sync(handler, state: _ServerState, body) -> Response:
             if time.monotonic() >= state.key_expires_at:
                 state.active_key = None  # expired -> slot is idle again (§2)
             else:
-                raise _ApiError(409, "session_conflict", "a session is already active")
+                raise ApiError(409, "session_conflict", "a session is already active")
         key = uuid.uuid4().hex
         state.active_key = key
         state.key_expires_at = time.monotonic() + KEY_TTL_SECONDS
@@ -218,10 +206,10 @@ def _ep_start_sync(handler, state: _ServerState, body) -> Response:
 def _ep_collect(handler, state: _ServerState, body) -> Response:
     """POST /v1/collect — start the (stub) collection job (§6.2)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     with state.lock:
         if state.collect_job is not None:
-            raise _ApiError(409, "collection_in_progress",
+            raise ApiError(409, "collection_in_progress",
                             "a collection is already running")
         job = uuid.uuid4().hex
         state.collect_job = job
@@ -235,10 +223,10 @@ def _ep_collect_status(handler, state: _ServerState, body) -> Response:
     Reports an empty remote set: no photos, no extra copies.
     """
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     with state.lock:
         if state.collect_job is None:
-            raise _ApiError(404, "no_collection", "no collection has been started")
+            raise ApiError(404, "no_collection", "no collection has been started")
         if state.collect_done_polls < state.running_polls_before_done:
             state.collect_done_polls += 1
             # progress is a 0.0..1.0 fraction, monotonic, <1.0 until done.
@@ -251,9 +239,9 @@ def _ep_collect_status(handler, state: _ServerState, body) -> Response:
 def _ep_upload(handler, state: _ServerState, body) -> Response:
     """POST /v1/upload — accept the final file, keep a copy of the payload (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "hash" not in body:
-        raise _ApiError(400, "bad_request", "upload body must carry a hash")
+        raise ApiError(400, "bad_request", "upload body must carry a hash")
     asset_id = uuid.uuid4().hex
     with state.lock:
         state.uploads[body["hash"]] = {
@@ -270,19 +258,19 @@ def _ep_upload(handler, state: _ServerState, body) -> Response:
 def _ep_delete(handler, state: _ServerState, body) -> Response:
     """POST /v1/delete — pretend to delete (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     target = (body or {}).get("hash") or (body or {}).get("asset_id")
     if target is None:
-        raise _ApiError(400, "bad_request", "delete body must carry a hash or asset_id")
+        raise ApiError(400, "bad_request", "delete body must carry a hash or asset_id")
     return Response(200, {"ok": True, "deleted": target})
 
 
 def _ep_move(handler, state: _ServerState, body) -> Response:
     """POST /v1/move — pretend to update the asset's metadata (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "hash" not in body:
-        raise _ApiError(400, "bad_request", "move body must carry a hash")
+        raise ApiError(400, "bad_request", "move body must carry a hash")
     return Response(200, {"ok": True, "moved": body["hash"],
                           "album": body.get("album"),
                           "record": body.get("record")})
@@ -291,27 +279,27 @@ def _ep_move(handler, state: _ServerState, body) -> Response:
 def _ep_create_album(handler, state: _ServerState, body) -> Response:
     """POST /v1/album/create (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
-        raise _ApiError(400, "bad_request", "album/create body must carry an identity")
+        raise ApiError(400, "bad_request", "album/create body must carry an identity")
     return Response(200, {"ok": True, "identity": body["identity"], "name": body.get("name")})
 
 
 def _ep_delete_album(handler, state: _ServerState, body) -> Response:
     """POST /v1/album/delete (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
-        raise _ApiError(400, "bad_request", "album/delete body must carry an identity")
+        raise ApiError(400, "bad_request", "album/delete body must carry an identity")
     return Response(200, {"ok": True, "identity": body["identity"]})
 
 
 def _ep_rename_album(handler, state: _ServerState, body) -> Response:
     """POST /v1/album/rename (§6.3)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     if not body or "identity" not in body:
-        raise _ApiError(400, "bad_request", "album/rename body must carry an identity")
+        raise ApiError(400, "bad_request", "album/rename body must carry an identity")
     return Response(200, {"ok": True, "identity": body["identity"],
                           "new_name": body.get("new_name")})
 
@@ -319,7 +307,7 @@ def _ep_rename_album(handler, state: _ServerState, body) -> Response:
 def _ep_stop_sync(handler, state: _ServerState, body) -> Response:
     """POST /v1/sync/stop — invalidate the key, slot back to idle (§6.4)."""
     if not state.check_key(handler._auth_key()):  # noqa: SLF001
-        raise _ApiError(401, "invalid_key", "missing or invalid session key")
+        raise ApiError(401, "invalid_key", "missing or invalid session key")
     with state.lock:
         state.active_key = None
         state.collect_job = None
